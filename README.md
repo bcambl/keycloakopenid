@@ -42,7 +42,7 @@ First, enable the plugins support in your Traefik configuration file (traefik.ym
 experimental:
   plugins:
     keycloakopenid:
-      moduleName: "github.com/Gwojda/keycloakopenid"
+      moduleName: "github.com/bcambl/keycloakopenid"
       version: "v0.1.35"
 ```
 

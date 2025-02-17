@@ -1,3 +1,3 @@
-module github.com/Gwojda/keycloakopenid
+module github.com/bcambl/keycloakopenid
 
-go 1.19
+go 1.23.6
