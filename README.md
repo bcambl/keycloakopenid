@@ -43,7 +43,7 @@ experimental:
   plugins:
     keycloakopenid:
       moduleName: "github.com/bcambl/keycloakopenid"
-      version: "v0.1.37"
+      version: "v0.1.38"
 ```
 
 Usage

@@ -7,11 +7,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 )
 
 type Config struct {
 	KeycloakURL        string `json:"url"`
+	InsecureSkipVerify bool   `json:"insecure_skip_verify"`
 	ClientID           string `json:"client_id"`
 	ClientSecret       string `json:"client_secret"`
 	KeycloakRealm      string `json:"keycloak_realm"`
@@ -25,6 +27,7 @@ type Config struct {
 	ClientIDFile          string `json:"client_id_file"`
 	ClientSecretFile      string `json:"client_secret_file"`
 	KeycloakURLEnv        string `json:"url_env"`
+	InsecureSkipVerifyEnv string `json:"insecure_skip_verify_env"`
 	ClientIDEnv           string `json:"client_id_env"`
 	ClientSecretEnv       string `json:"client_secret_env"`
 	KeycloakRealmEnv      string `json:"keycloak_realm_env"`
@@ -37,6 +40,7 @@ type Config struct {
 type keycloakAuth struct {
 	next               http.Handler
 	KeycloakURL        *url.URL
+	InsecureSkipVerify bool
 	ClientID           string
 	ClientSecret       string
 	KeycloakRealm      string
@@ -111,6 +115,17 @@ func readConfigEnv(config *Config) error {
 			return errors.New("KeycloakURLEnv referenced but NOT set")
 		}
 		config.KeycloakURL = strings.TrimSpace(keycloakUrl)
+	}
+	if config.InsecureSkipVerifyEnv != "" {
+		insecureSkipVerify := os.Getenv(config.InsecureSkipVerifyEnv)
+		if insecureSkipVerify == "" {
+			return errors.New("InsecureSkipVerifyEnv referenced but NOT set")
+		}
+		insecureSkipVerifyBool, err := strconv.ParseBool(insecureSkipVerify)
+		if err != nil {
+			return err
+		}
+		config.InsecureSkipVerify = insecureSkipVerifyBool
 	}
 	if config.ClientIDEnv != "" {
 		clientId := os.Getenv(config.ClientIDEnv)
@@ -216,6 +231,7 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 	return &keycloakAuth{
 		next:               next,
 		KeycloakURL:        parsedURL,
+		InsecureSkipVerify: config.InsecureSkipVerify,
 		ClientID:           config.ClientID,
 		ClientSecret:       config.ClientSecret,
 		KeycloakRealm:      config.KeycloakRealm,

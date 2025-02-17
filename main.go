@@ -1,6 +1,7 @@
 package keycloakopenid
 
 import (
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -59,9 +60,9 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 		if k.UseAuthHeader {
 			// Optionally set the Bearer token to the Authorization header.
-			req.Header.Set("Authorization", "Bearer " + token)
+			req.Header.Set("Authorization", "Bearer "+token)
 		}
-		
+
 		k.next.ServeHTTP(rw, req)
 	} else {
 		authCode := req.URL.Query().Get("code")
@@ -88,7 +89,7 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 		if k.UseAuthHeader {
 			// Optionally set the Bearer token to the Authorization header.
-			req.Header.Set("Authorization", "Bearer " + token)
+			req.Header.Set("Authorization", "Bearer "+token)
 		}
 
 		authCookie := &http.Cookie{
@@ -218,14 +219,19 @@ func (k *keycloakAuth) redirectToKeycloak(rw http.ResponseWriter, req *http.Requ
 		"client_id":     {k.ClientID},
 		"redirect_uri":  {originalURL},
 		"state":         {stateBase64},
-		"scope":				 {k.Scope},
+		"scope":         {k.Scope},
 	}.Encode()
 
 	http.Redirect(rw, req, redirectURL.String(), http.StatusTemporaryRedirect)
 }
 
 func (k *keycloakAuth) verifyToken(token string) (bool, error) {
-	client := &http.Client{}
+
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: k.InsecureSkipVerify},
+	}
+
+	client := &http.Client{Transport: tr}
 
 	data := url.Values{
 		"token": {token},
