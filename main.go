@@ -167,6 +167,9 @@ func (k *keycloakAuth) exchangeAuthCode(req *http.Request, authCode string, stat
 		"openid-connect",
 		"token",
 	)
+
+	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: k.InsecureSkipVerify}
+
 	resp, err := http.PostForm(target.String(),
 		url.Values{
 			"grant_type":    {"authorization_code"},
