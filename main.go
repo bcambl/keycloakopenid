@@ -80,7 +80,7 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 
 		fmt.Printf("exchange auth code called\n")
-		token, err := k.exchangeAuthCode(req, authCode, stateBase64)
+		token, err := k.exchangeAuthCode(authCode, stateBase64)
 		fmt.Printf("exchange auth code finished %+v\n", token)
 		if err != nil {
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
@@ -152,7 +152,7 @@ func extractClaims(tokenString string, claimName string) (string, error) {
 	return "", fmt.Errorf("missing claim %s", claimName)
 }
 
-func (k *keycloakAuth) exchangeAuthCode(req *http.Request, authCode string, stateBase64 string) (string, error) {
+func (k *keycloakAuth) exchangeAuthCode(authCode string, stateBase64 string) (string, error) {
 	stateBytes, _ := base64.StdEncoding.DecodeString(stateBase64)
 	var state state
 	err := json.Unmarshal(stateBytes, &state)
