@@ -1,0 +1,33 @@
+services:
+  traefik:
+    image: traefik:v3.3.3
+    command:
+      - --api.insecure=true
+      - --providers.docker
+      - --log.level=DEBUG
+      - --accesslog
+      - --experimental.localPlugins.keycloakopenid-local.moduleName=github.com/bcambl/keycloakopenid
+    ports:
+      - 80:80
+      - 8080:8080
+    volumes:
+      - /var/run/podman/podman.sock:/var/run/docker.sock
+      - .:/plugins-local/src/github.com/bcambl/keycloakopenid/
+    tty: true
+
+  whoami:
+    image: traefik/whoami # https://github.com/traefik/whoami
+    command: >-
+      -name whoami -verbose true
+    labels:
+      traefik.http.routers.keycloakopenid-local.rule: Host(`keycloakopenid-local.localhost`)
+      traefik.http.routers.keycloakopenid-local.middlewares: keycloakopenid-local
+      traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.KeycloakURL: https://keycloak.mydomain.com
+      traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.InsecureSkipVerify: false
+      traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.ClientID: example-client-id
+      traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.ClientSecret: W2VkM9QG1ttsKVChPbAchaHp1JEtVX2a
+      traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.KeycloakRealm: example-realm
+      traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.Scope: openid
+      traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.TokenCookieName: AUTH_TOKEN
+      traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.UseAuthHeader: false
+      traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.IgnorePathPrefixes: /favicon.ico
