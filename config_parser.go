@@ -2,6 +2,7 @@ package keycloakopenid
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/http"
@@ -199,6 +200,11 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 		return nil, err
 	}
 
+	keycloakURL, err := setKeycloakCompatURL(parsedURL, config.InsecureSkipVerify)
+	if err != nil {
+		return nil, err
+	}
+
 	if config.Scope == "" {
 		config.Scope = "openid"
 	}
@@ -230,7 +236,7 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 
 	return &keycloakAuth{
 		next:               next,
-		KeycloakURL:        parsedURL,
+		KeycloakURL:        keycloakURL,
 		InsecureSkipVerify: config.InsecureSkipVerify,
 		ClientID:           config.ClientID,
 		ClientSecret:       config.ClientSecret,
@@ -242,4 +248,52 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 		UserHeaderName:     userHeaderName,
 		IgnorePathPrefixes: ignorePathPrefixes,
 	}, nil
+}
+
+// setKeycloakCompatURL will test a couple well-known keycloak endpoints to determine if
+// the current keycloak instance is the older wildfly or the newer quarkus version and
+// and add dynamically add /auth to the url as required.
+func setKeycloakCompatURL(keycloakURL *url.URL, skipVerify bool) (*url.URL, error) {
+
+	realm := "master"
+
+	// default to newer quarkus by querying /realms/{realm}
+	target := keycloakURL.JoinPath("realms", realm)
+	fmt.Println("target: ", target.String())
+
+	// create a new http client
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: skipVerify},
+		},
+	}
+
+	// make a GET request to the target URL
+	resp, err := client.Get(target.String())
+	if err != nil {
+		return keycloakURL, err
+	}
+	defer resp.Body.Close()
+
+	// check status code
+	if resp.StatusCode == http.StatusOK {
+		return keycloakURL, nil
+	}
+
+	// if the status code is not 200, try the old wildfly URL
+	target = keycloakURL.JoinPath("auth", "realms", realm)
+
+	// make a GET request to the target URL
+	resp, err = client.Get(target.String())
+	if err != nil {
+		return keycloakURL, err
+	}
+	defer resp.Body.Close()
+
+	// check status code
+	if resp.StatusCode == http.StatusOK {
+		return keycloakURL.JoinPath("auth"), nil
+	}
+
+	return keycloakURL, errors.New("could not determine Keycloak compatibility")
 }
