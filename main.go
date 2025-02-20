@@ -95,7 +95,7 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		authCookie := &http.Cookie{
 			Name:     "Authorization",
 			Value:    "Bearer " + token,
-			Secure:   true,
+			Secure:   k.SecureCookie,
 			HttpOnly: true,
 			Path:     "/",
 			SameSite: http.SameSiteLaxMode, // Allows requests originating from sibling domains (same parent diff sub domain) to access the cookie
@@ -104,7 +104,7 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		tokenCookie := &http.Cookie{
 			Name:     k.TokenCookieName, // Defaults to "AUTH_TOKEN"
 			Value:    token,
-			Secure:   true,
+			Secure:   k.SecureCookie,
 			HttpOnly: true,
 			Path:     "/",
 			SameSite: http.SameSiteLaxMode, // Allows requests originating from sibling domains (same parent diff sub domain) to access the cookie
