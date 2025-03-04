@@ -25,6 +25,7 @@ type Config struct {
 	UserClaimName      string `json:"user_claim_name"`
 	UserHeaderName     string `json:"user_header_name"`
 	IgnorePathPrefixes string `json:"ignore_path_prefixes"`
+	LegacySupport      bool   `json:"legacy_support"`
 
 	ClientIDFile          string `json:"client_id_file"`
 	ClientSecretFile      string `json:"client_secret_file"`
@@ -38,6 +39,7 @@ type Config struct {
 	TokenCookieNameEnv    string `json:"token_cookie_name_env"`
 	UseAuthHeaderEnv      string `json:"use_auth_header_env"`
 	IgnorePathPrefixesEnv string `json:"ignore_path_prefixes_env"`
+	LegacySupportEnv      string `json:"legacy_support_env"`
 }
 
 type keycloakAuth struct {
@@ -193,6 +195,17 @@ func readConfigEnv(config *Config) error {
 		}
 		config.IgnorePathPrefixes = strings.TrimSpace(ignorePathPrefixes)
 	}
+	if config.LegacySupportEnv != "" {
+		legacySupport := os.Getenv(config.LegacySupportEnv)
+		if legacySupport == "" {
+			return errors.New("LegacySupportEnv referenced but NOT set")
+		}
+		legacySupportBool, err := strconv.ParseBool(legacySupport)
+		if err != nil {
+			return err
+		}
+		config.LegacySupport = legacySupportBool
+	}
 	return nil
 }
 
@@ -215,9 +228,13 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 		return nil, err
 	}
 
-	keycloakURL, err := setKeycloakCompatURL(parsedURL, config.KeycloakRealm, config.InsecureSkipVerify)
-	if err != nil {
-		return nil, err
+	keycloakURL := parsedURL
+	if config.LegacySupport {
+		compatUrl, err := setKeycloakCompatURL(parsedURL, config.KeycloakRealm, config.InsecureSkipVerify)
+		if err != nil {
+			return nil, err
+		}
+		keycloakURL = compatUrl
 	}
 
 	if config.Scope == "" {
