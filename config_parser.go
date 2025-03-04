@@ -215,7 +215,7 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 		return nil, err
 	}
 
-	keycloakURL, err := setKeycloakCompatURL(parsedURL, config.InsecureSkipVerify)
+	keycloakURL, err := setKeycloakCompatURL(parsedURL, config.KeycloakRealm, config.InsecureSkipVerify)
 	if err != nil {
 		return nil, err
 	}
@@ -269,9 +269,7 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 // setKeycloakCompatURL will test a couple well-known keycloak endpoints to determine if
 // the current keycloak instance is the older wildfly or the newer quarkus version and
 // and add dynamically add /auth to the url as required.
-func setKeycloakCompatURL(keycloakURL *url.URL, skipVerify bool) (*url.URL, error) {
-
-	realm := "master"
+func setKeycloakCompatURL(keycloakURL *url.URL, realm string, skipVerify bool) (*url.URL, error) {
 
 	// default to newer quarkus by querying /realms/{realm}
 	target := keycloakURL.JoinPath("realms", realm)
