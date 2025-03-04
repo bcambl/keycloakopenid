@@ -220,7 +220,7 @@ func (k *keycloakAuth) redirectToKeycloak(rw http.ResponseWriter, req *http.Requ
 	redirectURL.RawQuery = url.Values{
 		"response_type": {"code"},
 		"client_id":     {k.ClientID},
-		"redirect_uri":  {url.QueryEscape(originalURL)},
+		"redirect_uri":  {originalURL},
 		"state":         {stateBase64},
 		"scope":         {k.Scope},
 	}.Encode()
