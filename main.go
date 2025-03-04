@@ -111,9 +111,9 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 
 		http.SetCookie(rw, authCookie)
-		req.AddCookie(authCookie) // Add the cookie to the request so it is present on the redirect and prevents infite loop of redirects.
+		req.AddCookie(authCookie) // Add the cookie to the request so it is present on the redirect and prevents infinite loop of redirects.
 
-		// Set the token to a default/custom cookie that doesnt require trimming the Bearer prefix for common integration compatibility
+		// Set the token to a default/custom cookie that doesn't require trimming the Bearer prefix for common integration compatibility
 		http.SetCookie(rw, tokenCookie)
 		req.AddCookie(tokenCookie) // Add the cookie to the request so it is present on the initial redirect below.
 
@@ -132,7 +132,7 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 }
 
-func extractClaims(tokenString string, claimName string) (string, error) {
+func extractClaims(tokenString, claimName string) (string, error) {
 	jwtContent := strings.Split(tokenString, ".")
 	if len(jwtContent) < 3 {
 		return "", fmt.Errorf("malformed jwt")
@@ -141,8 +141,8 @@ func extractClaims(tokenString string, claimName string) (string, error) {
 	var jwtClaims map[string]interface{}
 	decoder := base64.StdEncoding.WithPadding(base64.NoPadding)
 
-	jwt_bytes, _ := decoder.DecodeString(jwtContent[1])
-	if err := json.Unmarshal(jwt_bytes, &jwtClaims); err != nil {
+	jwtBytes, _ := decoder.DecodeString(jwtContent[1])
+	if err := json.Unmarshal(jwtBytes, &jwtClaims); err != nil {
 		return "", err
 	}
 
@@ -152,7 +152,7 @@ func extractClaims(tokenString string, claimName string) (string, error) {
 	return "", fmt.Errorf("missing claim %s", claimName)
 }
 
-func (k *keycloakAuth) exchangeAuthCode(authCode string, stateBase64 string) (string, error) {
+func (k *keycloakAuth) exchangeAuthCode(authCode, stateBase64 string) (string, error) {
 	stateBytes, _ := base64.StdEncoding.DecodeString(stateBase64)
 	var state state
 	err := json.Unmarshal(stateBytes, &state)
@@ -220,7 +220,7 @@ func (k *keycloakAuth) redirectToKeycloak(rw http.ResponseWriter, req *http.Requ
 	redirectURL.RawQuery = url.Values{
 		"response_type": {"code"},
 		"client_id":     {k.ClientID},
-		"redirect_uri":  {originalURL},
+		"redirect_uri":  {url.QueryEscape(originalURL)},
 		"state":         {stateBase64},
 		"scope":         {k.Scope},
 	}.Encode()
@@ -229,7 +229,6 @@ func (k *keycloakAuth) redirectToKeycloak(rw http.ResponseWriter, req *http.Requ
 }
 
 func (k *keycloakAuth) verifyToken(token string) (bool, error) {
-
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: k.InsecureSkipVerify},
 	}
@@ -237,7 +236,9 @@ func (k *keycloakAuth) verifyToken(token string) (bool, error) {
 	client := &http.Client{Transport: tr}
 
 	data := url.Values{
-		"token": {token},
+		"token":         {token},
+		"client_id":     {k.ClientID},
+		"client_secret": {k.ClientSecret},
 	}
 
 	req, err := http.NewRequest(
@@ -257,7 +258,6 @@ func (k *keycloakAuth) verifyToken(token string) (bool, error) {
 	}
 
 	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-	req.SetBasicAuth(k.ClientID, k.ClientSecret)
 
 	resp, err := client.Do(req)
 	if err != nil {
