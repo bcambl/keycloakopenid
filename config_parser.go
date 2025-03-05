@@ -19,7 +19,6 @@ type Config struct {
 	ClientSecret       string `json:"client_secret"`
 	KeycloakRealm      string `json:"keycloak_realm"`
 	Scope              string `json:"scope"`
-	TokenCookieName    string `json:"token_cookie_name"`
 	UseAuthHeader      bool   `json:"use_auth_header"`
 	UserClaimName      string `json:"user_claim_name"`
 	UserHeaderName     string `json:"user_header_name"`
@@ -34,7 +33,6 @@ type Config struct {
 	ClientSecretEnv       string `json:"client_secret_env"`
 	KeycloakRealmEnv      string `json:"keycloak_realm_env"`
 	ScopeEnv              string `json:"scope_env"`
-	TokenCookieNameEnv    string `json:"token_cookie_name_env"`
 	UseAuthHeaderEnv      string `json:"use_auth_header_env"`
 	IgnorePathPrefixesEnv string `json:"ignore_path_prefixes_env"`
 	LegacySupportEnv      string `json:"legacy_support_env"`
@@ -48,7 +46,6 @@ type keycloakAuth struct {
 	ClientSecret       string
 	KeycloakRealm      string
 	Scope              string
-	TokenCookieName    string
 	UseAuthHeader      bool
 	UserClaimName      string
 	UserHeaderName     string
@@ -159,13 +156,6 @@ func readConfigEnv(config *Config) error {
 		}
 		config.Scope = scope //Do not trim space here as it is common to use space as a separator and should be properly escaped when encoded
 	}
-	if config.TokenCookieNameEnv != "" {
-		tokenCookieName := os.Getenv(config.TokenCookieNameEnv)
-		if tokenCookieName == "" {
-			return errors.New("TokenCookieNameEnv referenced but NOT set")
-		}
-		config.TokenCookieName = strings.TrimSpace(tokenCookieName)
-	}
 	if config.UseAuthHeaderEnv != "" {
 		useAuthHeader, exists := os.LookupEnv(config.UseAuthHeaderEnv)
 		if !exists {
@@ -227,11 +217,6 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 		config.Scope = "openid"
 	}
 
-	tokenCookieName := "AUTH_TOKEN"
-	if config.TokenCookieName != "" {
-		tokenCookieName = config.TokenCookieName
-	}
-
 	useAuthHeader := false
 	if config.UseAuthHeader {
 		useAuthHeader = true
@@ -260,7 +245,6 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 		ClientSecret:       config.ClientSecret,
 		KeycloakRealm:      config.KeycloakRealm,
 		Scope:              config.Scope,
-		TokenCookieName:    tokenCookieName,
 		UseAuthHeader:      useAuthHeader,
 		UserClaimName:      userClaimName,
 		UserHeaderName:     userHeaderName,

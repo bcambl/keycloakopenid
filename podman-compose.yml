@@ -29,6 +29,5 @@ services:
       traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.ClientSecret: W2VkM9QG1ttsKVChPbAchaHp1JEtVX2a
       traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.KeycloakRealm: example-realm
       traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.Scope: openid
-      traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.TokenCookieName: AUTH_TOKEN
       traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.UseAuthHeader: false
       traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.IgnorePathPrefixes: /favicon.ico
