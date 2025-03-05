@@ -56,6 +56,7 @@ type keycloakAuth struct {
 	UserClaimName      string
 	UserHeaderName     string
 	IgnorePathPrefixes []string
+	SessionStore       *SessionStore
 }
 
 type KeycloakTokenResponse struct {
@@ -280,6 +281,7 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 		UserClaimName:      userClaimName,
 		UserHeaderName:     userHeaderName,
 		IgnorePathPrefixes: ignorePathPrefixes,
+		SessionStore:       NewSessionStore(),
 	}, nil
 }
 

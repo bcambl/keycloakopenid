@@ -13,6 +13,22 @@ import (
 	"time"
 )
 
+func generateSessionID() string {
+	return fmt.Sprintf("%d", time.Now().UnixNano())
+}
+
+func (k *keycloakAuth) clearSessionCookie(rw http.ResponseWriter) {
+	expiration := time.Now().Add(-24 * time.Hour)
+	newCookie := &http.Cookie{
+		Name:    "SessionID",
+		Value:   "",
+		Path:    "/",
+		Expires: expiration,
+		MaxAge:  -1,
+	}
+	http.SetCookie(rw, newCookie)
+}
+
 func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	for _, substr := range k.IgnorePathPrefixes {
 		if strings.Contains(req.URL.Path, substr) {
@@ -20,116 +36,82 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			return
 		}
 	}
-	cookie, err := req.Cookie("Authorization")
-	if err == nil && strings.HasPrefix(cookie.Value, "Bearer ") {
-		token := strings.TrimPrefix(cookie.Value, "Bearer ")
-		fmt.Printf("token = %+v\n", token)
 
-		ok, err := k.verifyToken(token)
-		fmt.Printf("ok = %+v\n", ok)
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		if !ok {
-			qry := req.URL.Query()
-			qry.Del("code")
-			qry.Del("state")
-			qry.Del("session_state")
-			req.URL.RawQuery = qry.Encode()
-			req.RequestURI = req.URL.RequestURI()
-
-			expiration := time.Now().Add(-24 * time.Hour)
-			newCookie := &http.Cookie{
-				Name:    "Authorization",
-				Value:   "",
-				Path:    "/",
-				Expires: expiration,
-				MaxAge:  -1,
+	cookie, err := req.Cookie("SessionID")
+	if err == nil {
+		sessionID := cookie.Value
+		token, exists := k.SessionStore.Get(sessionID)
+		if exists {
+			ok, err := k.verifyToken(token)
+			if err != nil {
+				http.Error(rw, err.Error(), http.StatusInternalServerError)
+				return
 			}
-			http.SetCookie(rw, newCookie)
+			if !ok {
+				k.clearSessionCookie(rw)
+				k.redirectToKeycloak(rw, req)
+				return
+			}
 
-			k.redirectToKeycloak(rw, req)
+			user, err := extractClaims(token, k.UserClaimName)
+			if err == nil {
+				req.Header.Set(k.UserHeaderName, user)
+			}
+
+			if k.UseAuthHeader {
+				req.Header.Set("Authorization", "Bearer "+token)
+			}
+
+			k.next.ServeHTTP(rw, req)
 			return
 		}
-		user, err := extractClaims(token, k.UserClaimName)
-		if err == nil {
-			req.Header.Set(k.UserHeaderName, user)
-		}
-
-		if k.UseAuthHeader {
-			// Optionally set the Bearer token to the Authorization header.
-			req.Header.Set("Authorization", "Bearer "+token)
-		}
-
-		k.next.ServeHTTP(rw, req)
-	} else {
-		authCode := req.URL.Query().Get("code")
-		if authCode == "" {
-			fmt.Printf("code is missing, redirect to keycloak\n")
-			k.redirectToKeycloak(rw, req)
-			return
-		}
-
-		stateBase64 := req.URL.Query().Get("state")
-		if stateBase64 == "" {
-			fmt.Printf("state is missing, redirect to keycloak\n")
-			k.redirectToKeycloak(rw, req)
-			return
-		}
-
-		fmt.Printf("exchange auth code called\n")
-		token, err := k.exchangeAuthCode(authCode, stateBase64)
-		fmt.Printf("exchange auth code finished %+v\n", token)
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		if k.UseAuthHeader {
-			// Optionally set the Bearer token to the Authorization header.
-			req.Header.Set("Authorization", "Bearer "+token)
-		}
-
-		authCookie := &http.Cookie{
-			Name:     "Authorization",
-			Value:    "Bearer " + token,
-			Secure:   k.SecureCookie,
-			HttpOnly: true,
-			Path:     "/",
-			SameSite: http.SameSiteLaxMode, // Allows requests originating from sibling domains (same parent diff sub domain) to access the cookie
-		}
-
-		tokenCookie := &http.Cookie{
-			Name:     k.TokenCookieName, // Defaults to "AUTH_TOKEN"
-			Value:    token,
-			Secure:   k.SecureCookie,
-			HttpOnly: true,
-			Path:     "/",
-			SameSite: http.SameSiteLaxMode, // Allows requests originating from sibling domains (same parent diff sub domain) to access the cookie
-		}
-
-		http.SetCookie(rw, authCookie)
-		req.AddCookie(authCookie) // Add the cookie to the request so it is present on the redirect and prevents infinite loop of redirects.
-
-		// Set the token to a default/custom cookie that doesn't require trimming the Bearer prefix for common integration compatibility
-		http.SetCookie(rw, tokenCookie)
-		req.AddCookie(tokenCookie) // Add the cookie to the request so it is present on the initial redirect below.
-
-		qry := req.URL.Query()
-		qry.Del("code")
-		qry.Del("state")
-		qry.Del("session_state")
-		req.URL.RawQuery = qry.Encode()
-		req.RequestURI = req.URL.RequestURI()
-
-		scheme := req.Header.Get("X-Forwarded-Proto")
-		host := req.Header.Get("X-Forwarded-Host")
-		originalURL := fmt.Sprintf("%s://%s%s", scheme, host, req.RequestURI)
-
-		http.Redirect(rw, req, originalURL, http.StatusTemporaryRedirect)
 	}
+
+	authCode := req.URL.Query().Get("code")
+	if authCode == "" {
+		k.redirectToKeycloak(rw, req)
+		return
+	}
+
+	stateBase64 := req.URL.Query().Get("state")
+	if stateBase64 == "" {
+		k.redirectToKeycloak(rw, req)
+		return
+	}
+
+	token, err := k.exchangeAuthCode(authCode, stateBase64)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	sessionID := generateSessionID()
+	k.SessionStore.Set(sessionID, token, time.Hour) // Set token with 1-hour TTL
+
+	sessionCookie := &http.Cookie{
+		Name:     "SessionID",
+		Value:    sessionID,
+		Secure:   k.SecureCookie,
+		HttpOnly: true,
+		Path:     "/",
+		SameSite: http.SameSiteLaxMode,
+	}
+
+	http.SetCookie(rw, sessionCookie)
+	req.AddCookie(sessionCookie)
+
+	qry := req.URL.Query()
+	qry.Del("code")
+	qry.Del("state")
+	qry.Del("session_state")
+	req.URL.RawQuery = qry.Encode()
+	req.RequestURI = req.URL.RequestURI()
+
+	scheme := req.Header.Get("X-Forwarded-Proto")
+	host := req.Header.Get("X-Forwarded-Host")
+	originalURL := fmt.Sprintf("%s://%s%s", scheme, host, req.RequestURI)
+
+	http.Redirect(rw, req, originalURL, http.StatusTemporaryRedirect)
 }
 
 func extractClaims(tokenString, claimName string) (string, error) {

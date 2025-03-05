@@ -14,13 +14,14 @@ services:
       - /var/run/podman/podman.sock:/var/run/docker.sock
       - .:/plugins-local/src/github.com/bcambl/keycloakopenid/
     tty: true
+    network_mode: host
 
   whoami:
     image: traefik/whoami # https://github.com/traefik/whoami
     command: >-
       -name whoami -verbose true
     labels:
-      traefik.http.routers.keycloakopenid-local.rule: Host(`keycloakopenid-local.localhost`)
+      traefik.http.routers.keycloakopenid-local.rule: Host(`localhost`)
       traefik.http.routers.keycloakopenid-local.middlewares: keycloakopenid-local
       traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.KeycloakURL: https://keycloak.mydomain.com
       traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.InsecureSkipVerify: false
