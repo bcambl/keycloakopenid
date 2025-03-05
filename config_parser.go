@@ -15,7 +15,6 @@ import (
 type Config struct {
 	KeycloakURL        string `json:"url"`
 	InsecureSkipVerify bool   `json:"insecure_skip_verify"`
-	SecureCookie       bool   `json:"secure_cookie"`
 	ClientID           string `json:"client_id"`
 	ClientSecret       string `json:"client_secret"`
 	KeycloakRealm      string `json:"keycloak_realm"`
@@ -31,7 +30,6 @@ type Config struct {
 	ClientSecretFile      string `json:"client_secret_file"`
 	KeycloakURLEnv        string `json:"url_env"`
 	InsecureSkipVerifyEnv string `json:"insecure_skip_verify_env"`
-	SecureCookieEnv       string `json:"secure_cookie_env"`
 	ClientIDEnv           string `json:"client_id_env"`
 	ClientSecretEnv       string `json:"client_secret_env"`
 	KeycloakRealmEnv      string `json:"keycloak_realm_env"`
@@ -46,7 +44,6 @@ type keycloakAuth struct {
 	next               http.Handler
 	KeycloakURL        *url.URL
 	InsecureSkipVerify bool
-	SecureCookie       bool
 	ClientID           string
 	ClientSecret       string
 	KeycloakRealm      string
@@ -133,18 +130,6 @@ func readConfigEnv(config *Config) error {
 			return err
 		}
 		config.InsecureSkipVerify = insecureSkipVerifyBool
-	}
-	config.SecureCookie = true // default to secure cookie
-	if config.SecureCookieEnv != "" {
-		secureCookie := os.Getenv(config.SecureCookieEnv)
-		if secureCookie == "" {
-			return errors.New("SecureCookieEnv referenced but NOT set")
-		}
-		secureCookieBool, err := strconv.ParseBool(secureCookie)
-		if err != nil {
-			return err
-		}
-		config.SecureCookie = secureCookieBool
 	}
 	if config.ClientIDEnv != "" {
 		clientId := os.Getenv(config.ClientIDEnv)
@@ -271,7 +256,6 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 		next:               next,
 		KeycloakURL:        keycloakURL,
 		InsecureSkipVerify: config.InsecureSkipVerify,
-		SecureCookie:       config.SecureCookie,
 		ClientID:           config.ClientID,
 		ClientSecret:       config.ClientSecret,
 		KeycloakRealm:      config.KeycloakRealm,
@@ -287,7 +271,7 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 
 // setKeycloakCompatURL will test a couple well-known keycloak endpoints to determine if
 // the current keycloak instance is the older wildfly or the newer quarkus version and
-// and add dynamically add /auth to the url as required.
+// and dynamically add /auth to the url as required.
 func setKeycloakCompatURL(keycloakURL *url.URL, realm string, skipVerify bool) (*url.URL, error) {
 
 	// default to newer quarkus by querying /realms/{realm}

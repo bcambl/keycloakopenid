@@ -91,7 +91,7 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	sessionCookie := &http.Cookie{
 		Name:     "SessionID",
 		Value:    sessionID,
-		Secure:   k.SecureCookie,
+		Secure:   true,
 		HttpOnly: true,
 		Path:     "/",
 		SameSite: http.SameSiteLaxMode,
