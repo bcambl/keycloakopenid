@@ -1,6 +1,7 @@
 package keycloakopenid
 
 import (
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -13,8 +14,12 @@ import (
 	"time"
 )
 
-func generateSessionID() string {
-	return fmt.Sprintf("%d", time.Now().UnixNano())
+func generateSessionID() (string, error) {
+	randomBytes := make([]byte, 64)
+	if _, err := rand.Read(randomBytes); err != nil {
+		return "", err
+	}
+	return base64.URLEncoding.EncodeToString(randomBytes), nil
 }
 
 func (k *keycloakAuth) clearSessionCookie(rw http.ResponseWriter) {
@@ -85,7 +90,11 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	sessionID := generateSessionID()
+	sessionID, err := generateSessionID()
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	k.SessionStore.Set(sessionID, token, time.Hour) // Set token with 1-hour TTL
 
 	sessionCookie := &http.Cookie{
