@@ -118,3 +118,7 @@ http:
           UserClaimName: "my-uncommon-claim"
           UserHeaderName: "X-Custom-Header"
 ```
+
+## Local development
+
+For a complete Podman-based development stack with Keycloak, two protected example apps, Makefile targets, and an end-to-end smoke test, see [dev/README.md](dev/README.md). Run `make help` from the repository root to list development and test targets.

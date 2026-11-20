@@ -1,0 +1,10 @@
+FROM golang:1.23-alpine AS build
+WORKDIR /src
+COPY go.mod main.go ./
+RUN CGO_ENABLED=0 go build -o /helloworld .
+
+FROM alpine:3.21
+COPY --from=build /helloworld /usr/local/bin/helloworld
+USER 65534:65534
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/helloworld"]

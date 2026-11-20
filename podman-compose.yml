@@ -1,33 +1,50 @@
 services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.3.5
+    command:
+      - start-dev
+      - --http-host=0.0.0.0
+      - --http-port=8081
+      - --import-realm
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: demo-admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: demo-admin-password
+    ports:
+      - "127.0.0.1:8081:8081"
+    volumes:
+      - ./dev/keycloak:/opt/keycloak/data/import:ro
+    security_opt:
+      - label=disable
+
   traefik:
     image: traefik:v3.3.3
     command:
-      - --api.insecure=true
-      - --providers.docker
-      - --log.level=DEBUG
-      - --accesslog
-      - --experimental.localPlugins.keycloakopenid-local.moduleName=github.com/bcambl/keycloakopenid
-    ports:
-      - 80:80
-      - 8080:8080
-    volumes:
-      - /var/run/podman/podman.sock:/var/run/docker.sock
-      - .:/plugins-local/src/github.com/bcambl/keycloakopenid/
-    tty: true
+      - --configFile=/etc/traefik/traefik.yml
     network_mode: host
+    volumes:
+      - .:/plugins-local/src/github.com/bcambl/keycloakopenid:ro
+      - ./dev/traefik:/etc/traefik:ro
+    security_opt:
+      - label=disable
+    depends_on:
+      - keycloak
 
-  whoami:
-    image: traefik/whoami # https://github.com/traefik/whoami
-    command: >-
-      -name whoami -verbose true
-    labels:
-      traefik.http.routers.keycloakopenid-local.rule: Host(`localhost`)
-      traefik.http.routers.keycloakopenid-local.middlewares: keycloakopenid-local
-      traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.KeycloakURL: https://keycloak.mydomain.com
-      traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.InsecureSkipVerify: false
-      traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.ClientID: example-client-id
-      traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.ClientSecret: W2VkM9QG1ttsKVChPbAchaHp1JEtVX2a
-      traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.KeycloakRealm: example-realm
-      traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.Scope: openid
-      traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.UseAuthHeader: false
-      traefik.http.middlewares.keycloakopenid-local.plugin.keycloakopenid-local.IgnorePathPrefixes: /favicon.ico
+  helloworld1:
+    build:
+      context: ./dev/helloworld
+      dockerfile: Containerfile
+    environment:
+      APP_NAME: helloworld1
+      OTHER_APP_URL: http://helloworld2.localhost:8000
+    ports:
+      - "127.0.0.1:9001:8080"
+
+  helloworld2:
+    build:
+      context: ./dev/helloworld
+      dockerfile: Containerfile
+    environment:
+      APP_NAME: helloworld2
+      OTHER_APP_URL: http://helloworld1.localhost:8000
+    ports:
+      - "127.0.0.1:9002:8080"

@@ -1,0 +1,19 @@
+entryPoints:
+  web:
+    address: 127.0.0.1:8000
+  traefik:
+    address: 127.0.0.1:8090
+
+api:
+  dashboard: true
+  insecure: true
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+
+experimental:
+  localPlugins:
+    keycloakopenid-local:
+      moduleName: github.com/bcambl/keycloakopenid
