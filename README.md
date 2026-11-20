@@ -122,3 +122,5 @@ http:
 ## Local development
 
 For a complete Podman-based development stack with Keycloak, two protected example apps, Makefile targets, and an end-to-end smoke test, see [dev/README.md](dev/README.md). Run `make help` from the repository root to list development and test targets.
+
+To demonstrate several apps behind one host at different paths (`/helloworld1`, `/helloworld2`) on k3s, see [dev/k3s/README.md](dev/k3s/README.md). It sets up an existing Fedora VM with `make vm-up` and compares per-app clients with one shared client.

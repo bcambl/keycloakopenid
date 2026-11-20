@@ -1,0 +1,92 @@
+---
+- name: Tear down the k3s demo
+  hosts: all
+  become: true
+  vars:
+    uninstall_k3s: false
+  tasks:
+    - name: Check whether k3s is installed
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s
+      register: k3s_binary
+
+    - name: Remove the demo namespace and everything in it
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - delete
+          - namespace
+          - "{{ demo_namespace }}"
+          - --ignore-not-found
+          - --wait=true
+          - --timeout=180s
+      register: demo_namespace_delete
+      changed_when: "'deleted' in demo_namespace_delete.stdout"
+      when: k3s_binary.stat.exists and not uninstall_k3s | bool
+
+    - name: Remove the Traefik plugin chart configuration manifest
+      ansible.builtin.file:
+        path: /var/lib/rancher/k3s/server/manifests/traefik-config.yaml
+        state: absent
+      when: k3s_binary.stat.exists and not uninstall_k3s | bool
+
+    - name: Remove the Traefik plugin chart configuration resource
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - delete
+          - helmchartconfig.helm.cattle.io/traefik
+          - --namespace=kube-system
+          - --ignore-not-found
+      register: helmchartconfig_delete
+      changed_when: "'deleted' in helmchartconfig_delete.stdout"
+      when: k3s_binary.stat.exists and not uninstall_k3s | bool
+
+    - name: Wait for Traefik to roll back to the default chart values
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - rollout
+          - status
+          - deployment/traefik
+          - --namespace=kube-system
+          - --timeout=60s
+      register: traefik_rollout
+      changed_when: false
+      retries: 10
+      delay: 6
+      until: traefik_rollout.rc == 0
+      when: k3s_binary.stat.exists and not uninstall_k3s | bool
+
+    - name: Check for the k3s uninstall script
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s-uninstall.sh
+      register: k3s_uninstall_script
+      when: uninstall_k3s | bool
+
+    - name: Uninstall k3s
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s-uninstall.sh
+      changed_when: true
+      when: uninstall_k3s | bool and k3s_uninstall_script.stat.exists
+
+    - name: Remove demo files from the VM
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ ['/opt/keycloakopenid'] + (['/etc/keycloakopenid', '/usr/local/bin/k3s-install.sh'] if uninstall_k3s | bool else []) }}"
+
+    - name: Remove the helloworld image from Podman
+      ansible.builtin.command:
+        argv:
+          - podman
+          - rmi
+          - --ignore
+          - "{{ helloworld_image }}"
+      register: helloworld_rmi
+      changed_when: helloworld_rmi.stdout | length > 0
+      when: uninstall_k3s | bool

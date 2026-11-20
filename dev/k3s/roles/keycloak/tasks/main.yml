@@ -1,0 +1,33 @@
+---
+- name: Create the manifest directory on the VM
+  ansible.builtin.file:
+    path: "{{ manifest_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Render the Keycloak manifest
+  ansible.builtin.template:
+    src: keycloak.yaml.j2
+    dest: "{{ manifest_dir }}/keycloak.yaml"
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Apply the Keycloak manifest
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/apply-manifest.yml"
+  vars:
+    manifest_path: "{{ manifest_dir }}/keycloak.yaml"
+
+- name: Wait for Keycloak to import the realm and become ready
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/k3s
+      - kubectl
+      - rollout
+      - status
+      - deployment/keycloak
+      - "--namespace={{ demo_namespace }}"
+      - --timeout=600s
+  changed_when: false

@@ -1,0 +1,70 @@
+---
+- name: Create the helloworld build directory on the VM
+  ansible.builtin.file:
+    path: /opt/keycloakopenid/helloworld
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Copy the helloworld build context to the VM
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../helloworld/{{ item }}"
+    dest: /opt/keycloakopenid/helloworld/{{ item }}
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - Containerfile
+    - go.mod
+    - main.go
+
+- name: Build the helloworld image with Podman
+  ansible.builtin.command:
+    argv:
+      - podman
+      - build
+      - --tag
+      - "{{ helloworld_image }}"
+      - --file
+      - /opt/keycloakopenid/helloworld/Containerfile
+      - /opt/keycloakopenid/helloworld
+  changed_when: false
+
+- name: Read the built helloworld image ID
+  ansible.builtin.command:
+    argv:
+      - podman
+      - image
+      - inspect
+      - --format
+      - "{{ '{{' }}.Id{{ '}}' }}"
+      - "{{ helloworld_image }}"
+  register: helloworld_image_inspect
+  changed_when: false
+
+- name: Read the last imported helloworld image ID
+  ansible.builtin.slurp:
+    src: /opt/keycloakopenid/helloworld/.imported-id
+  register: helloworld_imported_id
+  failed_when: false
+
+- name: Record the helloworld image ID
+  ansible.builtin.set_fact:
+    helloworld_image_id: "{{ helloworld_image_inspect.stdout | trim }}"
+    helloworld_previous_id: "{{ (helloworld_imported_id.content | default('') | b64decode | trim) if helloworld_imported_id.content is defined else '' }}"
+
+- name: Import the helloworld image into k3s containerd
+  ansible.builtin.shell:
+    cmd: set -o pipefail && podman save "{{ helloworld_image }}" | /usr/local/bin/k3s ctr images import -
+    executable: /bin/bash
+  when: helloworld_image_id != helloworld_previous_id
+  changed_when: true
+
+- name: Remember the imported helloworld image ID
+  ansible.builtin.copy:
+    content: "{{ helloworld_image_id }}\n"
+    dest: /opt/keycloakopenid/helloworld/.imported-id
+    owner: root
+    group: root
+    mode: "0644"

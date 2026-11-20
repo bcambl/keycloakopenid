@@ -53,6 +53,10 @@ make restart
 
 Traefik's routes and plugin settings are in `dev/traefik/dynamic.yml`; its entrypoints and local-plugin setup are in `dev/traefik/traefik.yml`. Keycloak's clients and example users are in `dev/keycloak/demo-realm.json`. The apps are deliberately small and live in their own Go module under `dev/helloworld` so they do not affect the plugin module or Traefik plugin loader.
 
+## Path-based demo on k3s
+
+This stack routes each app by host name. For the common Kubernetes layout where several apps share one host and differ only by path, use the k3s demo in [k3s/README.md](k3s/README.md). It configures an existing Fedora VM from `VM_HOST`, `VM_USER` and `VM_PASS` with `make vm-up`, then `make vm-demo-per-app` and `make vm-demo-shared` show and test the two client layouts.
+
 ## Stop and troubleshoot
 
 Stop and remove the containers with:

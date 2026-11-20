@@ -1,0 +1,59 @@
+---
+- name: Install Fedora packages with DNF 5
+  ansible.builtin.dnf5:
+    name:
+      - firewalld
+      - openssl
+      - podman
+    state: present
+    auto_install_module_deps: true
+  when: ansible_facts.pkg_mgr == 'dnf5'
+
+- name: Install Fedora packages with DNF 4
+  ansible.builtin.dnf:
+    name:
+      - firewalld
+      - openssl
+      - podman
+    state: present
+    use_backend: dnf4
+  when: ansible_facts.pkg_mgr != 'dnf5'
+
+- name: Enable and start firewalld
+  ansible.builtin.service:
+    name: firewalld
+    enabled: true
+    state: started
+
+- name: Open the demo and k3s ports in firewalld
+  ansible.builtin.command:
+    argv:
+      - firewall-cmd
+      - --permanent
+      - "--add-port={{ item }}"
+  loop:
+    - 80/tcp
+    - 443/tcp
+    - 6443/tcp
+  register: firewalld_ports
+  changed_when: "'ALREADY_ENABLED' not in firewalld_ports.stderr"
+
+- name: Trust the k3s pod and service networks
+  ansible.builtin.command:
+    argv:
+      - firewall-cmd
+      - --permanent
+      - --zone=trusted
+      - "--add-source={{ item }}"
+  loop:
+    - 10.42.0.0/16
+    - 10.43.0.0/16
+  register: firewalld_sources
+  changed_when: "'ALREADY_ENABLED' not in firewalld_sources.stderr"
+
+- name: Reload firewalld after changing permanent rules
+  ansible.builtin.command:
+    argv:
+      - firewall-cmd
+      - --reload
+  when: firewalld_ports is changed or firewalld_sources is changed

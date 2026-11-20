@@ -1,0 +1,22 @@
+---
+- name: Validate {{ manifest_path | basename }} against the API server
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/k3s
+      - kubectl
+      - apply
+      - --dry-run=server
+      - -f
+      - "{{ manifest_path }}"
+  changed_when: false
+
+- name: Apply {{ manifest_path | basename }}
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/k3s
+      - kubectl
+      - apply
+      - -f
+      - "{{ manifest_path }}"
+  register: manifest_apply
+  changed_when: "' created' in manifest_apply.stdout or ' configured' in manifest_apply.stdout"

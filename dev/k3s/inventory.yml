@@ -1,0 +1,8 @@
+all:
+  hosts:
+    demo:
+      ansible_host: "{{ lookup('env', 'VM_HOST') }}"
+      ansible_user: "{{ lookup('env', 'VM_USER') }}"
+      ansible_password: "{{ lookup('env', 'VM_PASS') }}"
+      ansible_become: true
+      ansible_become_password: "{{ lookup('env', 'VM_PASS') }}"

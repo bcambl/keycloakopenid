@@ -1,0 +1,126 @@
+---
+- name: Create the directory for demo TLS material
+  ansible.builtin.file:
+    path: /etc/keycloakopenid/tls
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Render the demo namespace manifest
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/k3s
+      - kubectl
+      - create
+      - namespace
+      - "{{ demo_namespace }}"
+      - --dry-run=client
+      - -o
+      - yaml
+  register: demo_namespace_manifest
+  changed_when: false
+
+- name: Apply the demo namespace manifest
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/k3s
+      - kubectl
+      - apply
+      - -f
+      - "-"
+    stdin: "{{ demo_namespace_manifest.stdout }}"
+  register: demo_namespace_apply
+  changed_when: "'created' in demo_namespace_apply.stdout or 'configured' in demo_namespace_apply.stdout"
+
+- name: Check whether the self-signed certificate and key exist
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - /etc/keycloakopenid/tls/tls.crt
+    - /etc/keycloakopenid/tls/tls.key
+  register: demo_tls_files
+
+- name: Read the SAN from an existing demo certificate
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - x509
+      - -in
+      - /etc/keycloakopenid/tls/tls.crt
+      - -noout
+      - -ext
+      - subjectAltName
+  register: demo_tls_certificate_check
+  changed_when: false
+  failed_when: false
+  when: demo_tls_files.results | selectattr('stat.exists', 'equalto', true) | list | length == 2
+
+- name: Generate a self-signed TLS certificate for VM_HOST
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - req
+      - -new
+      - -x509
+      - -nodes
+      - -days
+      - "3650"
+      - -newkey
+      - rsa:2048
+      - -keyout
+      - /etc/keycloakopenid/tls/tls.key
+      - -out
+      - /etc/keycloakopenid/tls/tls.crt
+      - -subj
+      - "/CN={{ vm_host }}"
+      - -addext
+      - "subjectAltName={{ vm_host_san }}"
+  when:
+    - demo_tls_files.results | selectattr('stat.exists', 'equalto', false) | list | length > 0 or (':' ~ vm_host ~ '\n') not in ((demo_tls_certificate_check.stdout | default('')) ~ '\n')
+  changed_when: true
+  no_log: true
+
+- name: Set restrictive permissions on the demo TLS material
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - path: /etc/keycloakopenid/tls/tls.key
+      mode: "0600"
+    - path: /etc/keycloakopenid/tls/tls.crt
+      mode: "0644"
+
+- name: Build a Kubernetes TLS secret manifest
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/k3s
+      - kubectl
+      - create
+      - secret
+      - tls
+      - demo-tls
+      - "--namespace={{ demo_namespace }}"
+      - --cert=/etc/keycloakopenid/tls/tls.crt
+      - --key=/etc/keycloakopenid/tls/tls.key
+      - --dry-run=client
+      - -o
+      - yaml
+  register: demo_tls_secret_manifest
+  changed_when: false
+  no_log: true
+
+- name: Apply the demo TLS secret
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/k3s
+      - kubectl
+      - apply
+      - -f
+      - "-"
+    stdin: "{{ demo_tls_secret_manifest.stdout }}"
+  register: demo_tls_secret_apply
+  changed_when: "'created' in demo_tls_secret_apply.stdout or 'configured' in demo_tls_secret_apply.stdout"
+  no_log: true

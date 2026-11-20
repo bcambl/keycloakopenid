@@ -1,0 +1,61 @@
+{% for app in helloworld_apps %}
+{% set client = keycloak_clients | selectattr('id', 'equalto', app.name) | first %}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ app.name }}-auth
+  namespace: {{ demo_namespace }}
+  labels:
+    app.kubernetes.io/part-of: keycloakopenid-demo
+    demo-mode: per-app
+spec:
+  plugin:
+    keycloakopenid:
+      KeycloakURL: {{ keycloak_url }}
+      InsecureSkipVerify: true
+      ClientID: {{ client.id }}
+      ClientSecret: {{ client.secret }}
+      KeycloakRealm: demo
+      Scope: openid profile email
+      UseAuthHeader: true
+      IgnorePathPrefixes: /favicon.ico,/healthz
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ app.name }}-strip
+  namespace: {{ demo_namespace }}
+  labels:
+    app.kubernetes.io/part-of: keycloakopenid-demo
+    demo-mode: per-app
+spec:
+  stripPrefix:
+    prefixes:
+      - /{{ app.name }}
+{% endfor %}
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: helloworld-per-app
+  namespace: {{ demo_namespace }}
+  labels:
+    app.kubernetes.io/part-of: keycloakopenid-demo
+    demo-mode: per-app
+spec:
+  entryPoints:
+    - websecure
+  routes:
+{% for app in helloworld_apps %}
+    - kind: Rule
+      match: PathPrefix(`/{{ app.name }}`)
+      middlewares:
+        - name: {{ app.name }}-auth
+        - name: {{ app.name }}-strip
+      services:
+        - name: {{ app.name }}
+          port: 80
+{% endfor %}
+  tls:
+    secretName: demo-tls
