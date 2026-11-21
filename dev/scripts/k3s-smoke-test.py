@@ -195,8 +195,8 @@ class Demo:
         first = self.login("helloworld1")
         print("helloworld1 receives Alice and the bearer token")
 
-        # The browser sends helloworld1's cookie (Path=/) to helloworld2, whose plugin
-        # instance has its own session store and does not recognise it.
+        # The browser sends helloworld1's cookie (Path=/) to helloworld2, whose Keycloak
+        # client has its own session store and does not recognise it.
         second = self.sso("helloworld2", first)
         require(second != first, "helloworld2 should issue a different SessionID")
         print("helloworld2 completes SSO without a password and overwrites SessionID (Path=/)")

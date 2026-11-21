@@ -61,10 +61,11 @@ type keycloakAuth struct {
 }
 
 type KeycloakTokenResponse struct {
-	AccessToken  string `json:"access_token"`
-	TokenType    string `json:"token_type"`
-	ExpiresIn    int    `json:"expires_in"`
-	RefreshToken string `json:"refresh_token"`
+	AccessToken      string `json:"access_token"`
+	TokenType        string `json:"token_type"`
+	ExpiresIn        int    `json:"expires_in"`
+	RefreshToken     string `json:"refresh_token"`
+	RefreshExpiresIn int    `json:"refresh_expires_in"`
 }
 
 type state struct {
@@ -287,7 +288,7 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 		UserClaimName:       userClaimName,
 		UserHeaderName:      userHeaderName,
 		IgnorePathPrefixes:  ignorePathPrefixes,
-		SessionStore:        NewSessionStore(),
+		SessionStore:        sharedSessionStore(strings.Join([]string{keycloakURL.String(), config.KeycloakRealm, config.ClientID}, "\x00")),
 		SilentRenewal:       silentRenewal,
 		RefreshBeforeExpiry: refreshBeforeExpiry,
 	}, nil

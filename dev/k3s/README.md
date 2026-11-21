@@ -60,7 +60,7 @@ You can re-run `make vm-up` safely. The first run takes several minutes. It inst
 
 ## The two modes
 
-The plugin always issues a single cookie named `SessionID` with `Path=/`. It stores sessions in memory, separately for each plugin instance. Traefik creates a separate plugin instance for **each router** that uses a middleware, even when the routers reference the same Middleware resource. Together, these facts determine how path-based apps behave.
+The plugin always issues a single cookie named `SessionID` with `Path=/`. It stores sessions in memory, shared by every plugin instance that uses the same Keycloak client. Traefik creates a separate plugin instance for **each router** that uses a middleware, but instances configured with the same Keycloak URL, realm, and client ID see the same sessions. Together, these facts determine how path-based apps behave.
 
 ### Per-app clients (`make vm-demo-per-app`)
 
@@ -81,7 +81,7 @@ Host-based routing, as in the local Podman stack, does not have this problem, be
 
 ### Shared multi-app client (`make vm-demo-shared`)
 
-One Keycloak client (`helloworld-shared`, with redirect URIs for both paths) and **one** plugin instance protect both paths. Sharing a Middleware between two routers is not enough, because Traefik would still create two instances with two session stores. Instead, one router authenticates every app path and hands the request to a second, cluster-internal Traefik entrypoint. Per-path routers there strip the prefix and pick the backend:
+One Keycloak client (`helloworld-shared`, with redirect URIs for both paths) and **one** plugin instance protect both paths. Two routers sharing one Middleware would also share sessions, because both instances use the same client. This demo instead has one router authenticate every app path and hand the request to a second, cluster-internal Traefik entrypoint. Per-path routers there strip the prefix and pick the backend:
 
 ```
 websecure ─ /helloworld1 || /helloworld2 → shared-auth → traefik-internal:8001 (ClusterIP only)

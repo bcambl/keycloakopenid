@@ -99,7 +99,9 @@ func newTestKeycloak(t *testing.T) *testKeycloak {
 func newTestMiddleware(t *testing.T, kc *testKeycloak, config Config) *keycloakAuth {
 	t.Helper()
 	config.KeycloakURL = kc.srv.URL
-	config.ClientID = "c"
+	if config.ClientID == "" {
+		config.ClientID = "c"
+	}
 	config.ClientSecret = "s"
 	config.KeycloakRealm = "r"
 	config.UseAuthHeader = true
@@ -196,6 +198,21 @@ func TestRenewSessionUpdatesTokens(t *testing.T) {
 	remaining := time.Until(s.ExpiresAt)
 	if remaining < 295*time.Second || remaining > 305*time.Second {
 		t.Fatalf("ExpiresAt is %v away, want about 300s", remaining)
+	}
+}
+
+func TestRenewSessionRecordsRefreshExpiry(t *testing.T) {
+	kc := newTestKeycloak(t)
+	kc.tokenBody = `{"access_token":"new","refresh_token":"rt2","expires_in":300,"refresh_expires_in":1800}`
+	auth := newTestMiddleware(t, kc, Config{})
+	s := &Session{AccessToken: "old", RefreshToken: "rt1", ExpiresAt: time.Now().Add(-time.Second)}
+
+	if err := auth.renewSession(s); err != nil {
+		t.Fatalf("renewSession returned error: %v", err)
+	}
+	remaining := time.Until(s.RefreshExpiresAt)
+	if remaining < 1795*time.Second || remaining > 1805*time.Second {
+		t.Fatalf("RefreshExpiresAt is %v away, want about 1800s", remaining)
 	}
 }
 

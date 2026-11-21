@@ -137,7 +137,8 @@ Silent renewal is on by default. The plugin keeps a user's session alive for as 
 Requirements and limitations:
 
 - The Keycloak token response must contain a `refresh_token` (the default for the standard flow with confidential clients). If it is missing, the callback fails with an error so the misconfiguration is visible.
-- Sessions stay in memory per plugin instance. A Traefik restart means users sign in again. Run a single Traefik instance or use sticky sessions; multiple non-sticky replicas would race refresh-token rotation and force repeated logins.
+- Sessions stay in memory in the Traefik process and are shared by every plugin instance configured with the same Keycloak URL, realm, and client ID. Traefik creates an instance for each router that uses the middleware and recreates instances on every dynamic configuration reload; neither loses sessions. A Traefik restart means users sign in again. Run a single Traefik instance or use sticky sessions; multiple non-sticky replicas would race refresh-token rotation and force repeated logins.
+- A session is removed once its access token and its refresh token (`refresh_expires_in`) have both expired. Sessions whose refresh token has no reported expiry, such as offline tokens, stay until Keycloak refuses a refresh.
 - With `SilentRenewal: false`, the legacy behavior is used instead: one-hour session lifetime, introspection per request, and 307 redirects. Use this opt-out if you want the old behavior, for example to force periodic re-authentication.
 
 ## Local development
