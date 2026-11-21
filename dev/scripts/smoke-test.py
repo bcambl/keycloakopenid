@@ -266,7 +266,7 @@ def wait_for_stack():
             if keycloak.status == 200 and app.status == 200 and app.read().decode().strip() == "ok":
                 print("Keycloak and Traefik are ready")
                 return
-        except urllib.error.URLError:
+        except (urllib.error.URLError, OSError):
             pass
         time.sleep(2)
     raise RuntimeError("Timed out waiting for Keycloak and Traefik; inspect compose logs")
