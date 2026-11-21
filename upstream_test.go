@@ -19,6 +19,48 @@ func TestNewUpstreamHTTPClientTimeout(t *testing.T) {
 	}
 }
 
+func TestNewUpstreamHTTPClientUsesExplicitTransport(t *testing.T) {
+	original := http.DefaultTransport
+	http.DefaultTransport = nil
+	defer func() {
+		http.DefaultTransport = original
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("newUpstreamHTTPClient panicked with an unavailable default transport: %v", recovered)
+		}
+	}()
+
+	client := newUpstreamHTTPClient(true)
+	bounded, ok := client.Transport.(*boundedRoundTripper)
+	if !ok {
+		t.Fatalf("Transport = %T, want *boundedRoundTripper", client.Transport)
+	}
+	transport, ok := bounded.base.(*http.Transport)
+	if !ok {
+		t.Fatalf("base transport = %T, want *http.Transport", bounded.base)
+	}
+	if transport.Proxy == nil {
+		t.Fatal("Proxy is nil, want environment proxy support")
+	}
+	if !transport.ForceAttemptHTTP2 {
+		t.Fatal("ForceAttemptHTTP2 = false, want true")
+	}
+	if transport.TLSHandshakeTimeout != 10*time.Second {
+		t.Fatalf("TLSHandshakeTimeout = %v, want 10s", transport.TLSHandshakeTimeout)
+	}
+	if transport.IdleConnTimeout != 90*time.Second {
+		t.Fatalf("IdleConnTimeout = %v, want 90s", transport.IdleConnTimeout)
+	}
+	if transport.MaxIdleConns != 100 {
+		t.Fatalf("MaxIdleConns = %d, want 100", transport.MaxIdleConns)
+	}
+	if transport.ExpectContinueTimeout != time.Second {
+		t.Fatalf("ExpectContinueTimeout = %v, want 1s", transport.ExpectContinueTimeout)
+	}
+	if transport.TLSClientConfig == nil || !transport.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("TLSClientConfig does not preserve configured InsecureSkipVerify")
+	}
+}
+
 func TestNewUpstreamHTTPClientRefusesRedirect(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		http.Redirect(rw, req, "/final", http.StatusFound)

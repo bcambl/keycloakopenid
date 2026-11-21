@@ -17,13 +17,19 @@ const (
 
 var errResponseTooLarge = errors.New("upstream response exceeds 1 MiB limit")
 
-// newUpstreamHTTPClient returns a client for talking to Keycloak. The
-// transport is cloned from the process default (never mutated), requests are
+// newUpstreamHTTPClient returns a client for talking to Keycloak. Requests are
 // bounded by a 10-second timeout, redirects are refused, and response bodies
 // are capped at 1 MiB.
 func newUpstreamHTTPClient(insecureSkipVerify bool) *http.Client {
-	base := http.DefaultTransport.(*http.Transport).Clone()
-	base.TLSClientConfig = &tls.Config{InsecureSkipVerify: insecureSkipVerify}
+	base := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: insecureSkipVerify},
+	}
 	return &http.Client{
 		Transport: &boundedRoundTripper{base: base},
 		Timeout:   upstreamTimeout,
