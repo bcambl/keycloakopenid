@@ -45,8 +45,12 @@ keycloak_cookies = {}
 
 
 def request(url, data=None, headers=None):
+    headers = dict(headers or {})
+    if not urllib.parse.urlsplit(url).path.startswith("/auth/"):
+        headers.setdefault("Accept", "text/html")
+        headers.setdefault("Sec-Fetch-Mode", "navigate")
     try:
-        return opener.open(urllib.request.Request(url, data=data, headers=headers or {}), timeout=20)
+        return opener.open(urllib.request.Request(url, data=data, headers=headers), timeout=20)
     except urllib.error.HTTPError as response:
         return response
 
@@ -87,7 +91,7 @@ class Demo:
         return self.base + path
 
     def expect_keycloak_redirect(self, response, app, path_prefix):
-        require(response.status == 307, f"{app} should redirect to Keycloak; got {response.status}")
+        require(response.status == 303, f"{app} should redirect to Keycloak; got {response.status}")
         location = response.headers["Location"]
         require(location.startswith(self.url("/auth/realms/demo/")),
                 f"{app} redirect did not target the demo realm at /auth: {location}")
@@ -110,7 +114,7 @@ class Demo:
                 protected = request(self.url("/helloworld1/"))
                 location = protected.headers.get("Location", "")
                 client = query_of(location).get("client_id", [""])[0]
-                if (keycloak.status == 200 and health.status == 200 and protected.status == 307
+                if (keycloak.status == 200 and health.status == 200 and protected.status == 303
                         and client == CLIENT_IDS[self.mode]["helloworld1"]):
                     print(f"Keycloak, Traefik and the {self.mode} routes are ready")
                     return
@@ -161,7 +165,7 @@ class Demo:
     def finish_callback(self, callback, app):
         require(callback.startswith(self.url(f"/{app}/")), f"Keycloak did not return to /{app}: {callback}")
         response = request(callback)
-        require(response.status == 307, f"{app} callback returned {response.status}")
+        require(response.status == 303, f"{app} callback returned {response.status}")
         cookie = session_cookie(response)
         require("Secure" in cookie and "HttpOnly" in cookie and "Path=/" in cookie,
                 f"{app} did not issue a Secure, HttpOnly SessionID cookie with Path=/")
