@@ -45,6 +45,11 @@ type identity struct {
 // tokenSet carries the tokens and validated identity produced by an exchange
 // or refresh. RefreshExpiresIn is nil when the field is omitted, 0 for no fixed
 // expiry, and positive for a concrete expiry in seconds.
+//
+// A zero Identity (empty Subject and nil Claims) means the response carried no
+// ID token; the caller must preserve its existing identity. A non-empty Subject
+// is the validated subject from a returned ID token, which the caller must
+// compare against the established subject before applying the token set.
 type tokenSet struct {
 	AccessToken      string
 	RefreshToken     string
@@ -153,9 +158,12 @@ func discoverProvider(ctx context.Context, cfg runtimeConfig) (*oidc.Provider, s
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamResponse+1))
 	if err != nil {
 		return nil, "", nil, newOIDCError(oidcErrMalformed, errors.New("oidc: discovery response unreadable"))
+	}
+	if len(body) > maxUpstreamResponse {
+		return nil, "", nil, newOIDCError(oidcErrMalformed, errors.New("oidc: discovery response exceeds limit"))
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -250,6 +258,9 @@ func (c *oidcClient) exchange(ctx context.Context, code, verifier, nonce string)
 	tok, err := c.oauth.Exchange(c.withClient(ctx), code, oauth2.VerifierOption(verifier))
 	if err != nil {
 		return nil, sanitizeOAuthErr(err)
+	}
+	if tok.AccessToken == "" {
+		return nil, newOIDCError(oidcErrMalformed, errors.New("oidc: token response missing access_token"))
 	}
 	if tok.RefreshToken == "" {
 		return nil, newOIDCError(oidcErrMalformed, errors.New("oidc: token response missing refresh_token"))
@@ -367,8 +378,12 @@ func refreshExpirySeconds(tok *oauth2.Token) (*int, error) {
 }
 
 // sanitizeOAuthErr maps an error from the OAuth2 token flow to a classified
-// oidcError, discarding the upstream body.
+// oidcError, discarding the upstream body. Context cancellation and deadline
+// errors are propagated unchanged so callers can distinguish them.
 func sanitizeOAuthErr(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
 	var re *oauth2.RetrieveError
 	if errors.As(err, &re) {
 		code := re.Response.StatusCode

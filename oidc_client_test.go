@@ -305,6 +305,50 @@ func TestNewOIDCClientIssuerMismatch(t *testing.T) {
 	wantOIDCError(t, err, oidcErrMalformed)
 }
 
+func TestNewOIDCClientDiscoveryExceedsLocalLimit(t *testing.T) {
+	p := newOIDCTestProvider(t)
+	// A discovery body over 1 MiB must be rejected even when the upstream
+	// client does not bound the body itself, proving the local limit.
+	p.discoveryBody = strings.Repeat("x", (1<<20)+1)
+	_, err := newOIDCClient(context.Background(), runtimeConfig{
+		Issuer:       p.issuer,
+		ClientID:     p.clientID,
+		ClientSecret: "client-secret",
+		CallbackURL:  "https://app.test/callback",
+		Scope:        "openid",
+		Upstream:     &http.Client{},
+	})
+	wantOIDCError(t, err, oidcErrMalformed)
+}
+
+func TestNewOIDCClientDefaultsToRS256WhenAlgorithmsOmitted(t *testing.T) {
+	p := newOIDCTestProvider(t)
+	// Omit id_token_signing_alg_values_supported entirely; the OIDC default
+	// RS256 must still be accepted.
+	p.discoveryBody = mustJSON(map[string]any{
+		"issuer":                 p.issuer,
+		"authorization_endpoint": p.issuer + "/protocol/openid-connect/auth",
+		"token_endpoint":         p.issuer + "/protocol/openid-connect/token",
+		"introspection_endpoint": p.issuer + "/protocol/openid-connect/token/introspect",
+		"jwks_uri":               p.srv.URL + "/jwks",
+	})
+	c := p.newClient(t)
+
+	access := "access-token"
+	claims := p.baseClaims()
+	claims["nonce"] = "n0nce"
+	claims["at_hash"] = computeAtHash(access)
+	p.setToken(marshalTokenResponse(access, "refresh", p.signIDToken(claims), 300, nil))
+
+	ts, err := c.exchange(context.Background(), "code", "verifier", "n0nce")
+	if err != nil {
+		t.Fatalf("exchange returned error: %v", err)
+	}
+	if ts.Identity.Subject != "user-123" {
+		t.Fatalf("Identity.Subject = %q, want user-123", ts.Identity.Subject)
+	}
+}
+
 func TestAuthCodeURLContainsExactCallbackS256AndNonce(t *testing.T) {
 	p := newOIDCTestProvider(t)
 	c := p.newClient(t)
@@ -581,6 +625,18 @@ func TestExchangeRejectsMissingRefreshToken(t *testing.T) {
 	wantOIDCError(t, err, oidcErrMalformed)
 }
 
+func TestExchangeRejectsMissingAccessToken(t *testing.T) {
+	p := newOIDCTestProvider(t)
+	c := p.newClient(t)
+
+	claims := p.baseClaims()
+	claims["nonce"] = "n0nce"
+	p.setToken(marshalTokenResponse("", "refresh-token", p.signIDToken(claims), 300, nil))
+
+	_, err := c.exchange(context.Background(), "code", "verifier", "n0nce")
+	wantOIDCError(t, err, oidcErrMalformed)
+}
+
 func TestExchangeRejectsMalformedIDToken(t *testing.T) {
 	p := newOIDCTestProvider(t)
 	c := p.newClient(t)
@@ -833,5 +889,25 @@ func TestIntrospectRefusalDoesNotLeakBody(t *testing.T) {
 	wantOIDCError(t, err, oidcErrRefusal)
 	if strings.Contains(err.Error(), "SECRET_LEAK_MARKER") {
 		t.Fatalf("error leaked upstream body: %v", err)
+	}
+}
+
+func TestSanitizeOAuthErrPropagatesContextErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want error
+	}{
+		{"canceled", context.Canceled, context.Canceled},
+		{"deadline exceeded", context.DeadlineExceeded, context.DeadlineExceeded},
+		{"wrapped canceled", fmt.Errorf("token request: %w", context.Canceled), context.Canceled},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeOAuthErr(tc.err)
+			if !errors.Is(got, tc.want) {
+				t.Fatalf("sanitizeOAuthErr(%v) = %v, want errors.Is to match %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }
