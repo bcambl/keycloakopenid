@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Exercise the local Keycloak -> Traefik plugin -> example apps flow."""
 
+import html
+import json
 import re
 import time
 import urllib.error
@@ -39,7 +41,7 @@ opener = urllib.request.build_opener(NoRedirect())
 keycloak_cookies = {}
 
 
-def request(url, data=None, headers=None):
+def request(url, data=None, headers=None, method=None):
     headers = dict(headers or {})
     parsed = urllib.parse.urlsplit(url)
     if parsed.hostname in APP_HOSTS:
@@ -50,7 +52,10 @@ def request(url, data=None, headers=None):
             ("http", "127.0.0.1:8000", parsed.path, parsed.query, parsed.fragment)
         )
     try:
-        return opener.open(urllib.request.Request(url, data=data, headers=headers), timeout=20)
+        return opener.open(
+            urllib.request.Request(url, data=data, headers=headers, method=method),
+            timeout=20,
+        )
     except urllib.error.HTTPError as response:
         return response
 
@@ -117,6 +122,114 @@ def query_of(url):
 def require(condition, message):
     if not condition:
         raise RuntimeError(message)
+
+
+CLAIMS_BLOCK = re.compile(
+    r"Decoded token claims \(display only; not verified\)</h2>\s*<pre>(.*?)</pre>",
+    re.DOTALL,
+)
+
+
+def access_token_jti(body):
+    match = CLAIMS_BLOCK.search(body)
+    require(match is not None, "page did not include decoded token claims")
+    try:
+        claims = json.loads(html.unescape(match.group(1)))
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"decoded token claims were not valid JSON: {error}") from error
+    jti = claims.get("jti")
+    require(isinstance(jti, str) and jti, "access token claims did not include a nonempty jti")
+    return jti
+
+
+def session_cookie_expired(response, name):
+    for header in response.headers.get_all("Set-Cookie", []):
+        if not header.startswith(name + "="):
+            continue
+        max_age = re.search(r"Max-Age=(-?\d+)", header)
+        if max_age and int(max_age.group(1)) <= 0:
+            return True
+    return False
+
+
+def revoke_alice_sessions(keycloak_base):
+    credentials = urllib.parse.urlencode(
+        {
+            "grant_type": "password",
+            "client_id": "admin-cli",
+            "username": "demo-admin",
+            "password": "demo-admin-password",
+        }
+    ).encode()
+    response = request(
+        keycloak_base + "/realms/master/protocol/openid-connect/token",
+        data=credentials,
+    )
+    require(response.status == 200, f"admin token request returned {response.status}")
+    admin = json.loads(response.read().decode())
+    token = admin.get("access_token")
+    require(isinstance(token, str) and token, "admin token response did not include access_token")
+    authorization = {"Authorization": "Bearer " + token}
+
+    response = request(
+        keycloak_base
+        + "/admin/realms/demo/users?"
+        + urllib.parse.urlencode({"username": "alice"}),
+        headers=authorization,
+    )
+    require(response.status == 200, f"Alice lookup returned {response.status}")
+    users = json.loads(response.read().decode())
+    require(isinstance(users, list), "Alice lookup did not return a list")
+    alice = next((user for user in users if user.get("username") == "alice"), None)
+    require(alice is not None, "Alice was not found in the demo realm")
+    user_id = alice.get("id")
+    require(isinstance(user_id, str) and user_id, "Alice has no user id")
+
+    response = request(
+        keycloak_base + "/admin/realms/demo/users/" + urllib.parse.quote(user_id) + "/sessions",
+        headers=authorization,
+    )
+    require(response.status == 200, f"Alice session lookup returned {response.status}")
+    sessions = json.loads(response.read().decode())
+    require(isinstance(sessions, list), "Alice session lookup did not return a list")
+    require(sessions, "Alice had no Keycloak sessions to revoke")
+    for session in sessions:
+        session_id = session.get("id")
+        require(isinstance(session_id, str) and session_id, "Keycloak session has no id")
+        response = request(
+            keycloak_base
+            + "/admin/realms/demo/sessions/"
+            + urllib.parse.quote(session_id, safe=""),
+            headers=authorization,
+            method="DELETE",
+        )
+        require(response.status in (200, 204), f"session delete returned {response.status}")
+
+
+def check_token_lifecycle(session):
+    protected = "http://helloworld1.localhost:8000/protected"
+    response = request(protected, headers={"Cookie": session})
+    body = response.read().decode()
+    require(response.status == 200, f"lifecycle read returned {response.status}")
+    first_jti = access_token_jti(body)
+
+    time.sleep(11)
+    response = request(protected, headers={"Cookie": session})
+    body = response.read().decode()
+    require(response.status == 200, f"renewed read returned {response.status}")
+    second_jti = access_token_jti(body)
+    require(first_jti != second_jti, "access token was not renewed after its lifetime elapsed")
+    print("Access token renewed with a changed jti after its lifetime elapsed")
+
+    revoke_alice_sessions("http://127.0.0.1:8081")
+    print("Alice's demo Keycloak sessions were revoked through the Admin REST API")
+
+    time.sleep(11)
+    name = session.partition("=")[0]
+    response = request(protected, headers={"Cookie": session})
+    require(response.status == 303, f"revoked session should redirect; got {response.status}")
+    require(session_cookie_expired(response, name), "revoked session cookie was not expired")
+    print("Revoked session redirects to a fresh login and expires the session cookie")
 
 
 def wait_for_stack():
@@ -272,6 +385,8 @@ def main():
                        headers={"Cookie": f"{name}=invalid"})
     require(response.status == 303, f"invalid session should redirect; got {response.status}")
     print("Invalid session is rejected")
+
+    check_token_lifecycle(session)
 
 
 if __name__ == "__main__":

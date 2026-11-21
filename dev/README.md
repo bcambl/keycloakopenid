@@ -35,6 +35,8 @@ Run the end-to-end flow, including login, the fixed callback and return-path res
 make smoke
 ```
 
+The smoke test also verifies the token lifecycle. The demo realm issues 10-second access tokens and the middleware refreshes 2 seconds before expiry. After an initial protected read, the test waits 11 seconds, requires the same plugin session to be accepted, and requires a changed access-token `jti` in the decoded claims, proving a real renewal. It then obtains a master-realm administrator token through `admin-cli`, finds Alice, revokes every Keycloak session through the Admin REST API, and requires the next protected request with the old plugin cookie to redirect to login and expire the session cookie. Revocation ends the browser's Keycloak SSO session, so this check runs last. The administrator credentials and endpoints are for the demo environment only.
+
 The test uses Python's standard library and does not require external packages. Run the Go checks for both modules with:
 
 ```sh

@@ -20,6 +20,7 @@ spec:
       Scope: openid profile email
       UseAuthHeader: true
       CallbackURL: https://{{ vm_host }}{{ client.callback }}
+      RefreshBeforeExpiry: 2s
       IgnorePathPrefixes: /{{ app.name }}/favicon.ico,/{{ app.name }}/healthz
 ---
 apiVersion: traefik.io/v1alpha1

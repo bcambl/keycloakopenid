@@ -26,6 +26,7 @@ http:
           Scope: openid profile email
           UseAuthHeader: true
           CallbackURL: http://helloworld1.localhost:8000/callback
+          RefreshBeforeExpiry: 2s
           IgnorePathPrefixes: /favicon.ico,/healthz
     helloworld2-auth:
       plugin:
@@ -37,6 +38,7 @@ http:
           Scope: openid profile email
           UseAuthHeader: true
           CallbackURL: http://helloworld2.localhost:8000/callback
+          RefreshBeforeExpiry: 2s
           IgnorePathPrefixes: /favicon.ico,/healthz
 
   services:

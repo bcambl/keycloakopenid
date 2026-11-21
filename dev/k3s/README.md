@@ -98,6 +98,7 @@ Traefik creates a plugin instance per middleware, so the two app routers are sep
 - `/helloworldN/healthz` bypasses authentication through `IgnorePathPrefixes`, which matches by path segment: `/healthz` matches `/healthz` and `/healthz/...`, not every path that merely contains the text.
 - The plugin strips incoming `X-Forwarded-User` and `Authorization` on every request, so a client cannot spoof them. The smoke test sends hostile values on protected and ignored paths and checks they are removed.
 - Sessions are held in memory in the Traefik pod and are lost when Traefik restarts, for example after `make vm-sync`. Exactly one Traefik replica is supported; k3s runs one by default.
+- The smoke test finishes with a token lifecycle check. The demo realm issues 10-second access tokens and the middleware refreshes 2 seconds before expiry. The test waits 11 seconds and requires a changed access-token `jti`, then revokes Alice's Keycloak sessions through the `/auth` Admin REST API and requires the old plugin cookie to redirect to login with an expired session cookie. Revocation ends the browser's Keycloak SSO session, so this check runs last. These administrator credentials and endpoints are demo-only.
 
 ## Develop the plugin
 
