@@ -20,7 +20,7 @@ export VM_HOST VM_USER VM_PASS
 MODULES := . dev/helloworld
 GO_FILES := $(wildcard *.go) $(wildcard dev/helloworld/*.go)
 
-.PHONY: help tag-patch tag-minor tag-major fmt fmt-check vet lint test test-race cover tidy check up down restart logs ps smoke demo clean require-vm-env vm-venv vm-check vm-syntax vm-up vm-demo-per-app vm-demo-shared vm-sync vm-status vm-logs vm-down vm-uninstall-k3s vm-kubeconfig
+.PHONY: help tag-patch tag-minor tag-major fmt fmt-check vet lint test test-race cover tidy vendor-check check up down restart logs ps smoke demo clean require-vm-env vm-venv vm-check vm-syntax vm-up vm-demo-per-app vm-demo-shared vm-sync vm-status vm-logs vm-down vm-uninstall-k3s vm-kubeconfig
 
 help: ## Show all available targets
 	@awk 'BEGIN { FS = "## " }; /^[a-zA-Z0-9_-]+:.*## / { split($$1, target, ":"); printf "  %-18s %s\n", target[1], $$2 }' $(MAKEFILE_LIST)
@@ -99,7 +99,14 @@ tidy: ## Run go mod tidy in both Go modules
 		(cd "$$module" && $(GO) mod tidy); \
 	done
 
-check: fmt-check lint test ## Run formatting, lint, and test checks
+vendor-check: ## Verify `go mod vendor` produces no uncommitted diff
+	@GOPROXY=off $(GO) mod vendor
+	@git diff --quiet -- go.mod go.sum vendor || { \
+		printf 'Vendored dependencies are out of date; run `go mod vendor` and commit the changes.\n' >&2; \
+		exit 1; \
+	}
+
+check: fmt-check lint test vendor-check ## Run formatting, lint, test, and vendor checks
 
 up: ## Build and start the local Podman development stack
 	$(COMPOSE) up --build -d

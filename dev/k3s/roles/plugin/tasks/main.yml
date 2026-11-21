@@ -14,7 +14,16 @@
     owner: root
     group: root
     mode: "0644"
-  loop: "{{ query('fileglob', playbook_dir + '/../../*.go') + [playbook_dir + '/../../go.mod', playbook_dir + '/../../.traefik.yml'] }}"
+  loop: "{{ query('fileglob', playbook_dir + '/../../*.go') + query('fileglob', playbook_dir + '/../../go.sum') + [playbook_dir + '/../../go.mod', playbook_dir + '/../../.traefik.yml'] }}"
+
+- name: Copy the vendored plugin dependencies to the VM
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../vendor/"
+    dest: "{{ plugin_source_path }}/vendor"
+    owner: root
+    group: root
+    mode: "0644"
+    directory_mode: "0755"
 
 - name: Configure the packaged Traefik chart for the local plugin
   ansible.builtin.template:

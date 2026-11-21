@@ -104,6 +104,12 @@ This middleware authenticates and identifies the user. It does not authorize. `X
 - `CallbackURL` is now required and must be registered on the Keycloak client. Existing deployments must add it and update their client redirect URIs.
 - `LegacySupport` no longer changes session behavior; it only probes for an older Keycloak `/auth` prefix. Remove it unless you target such an instance.
 
+## Plugin dependencies
+
+Traefik runs this plugin through Yaegi, which resolves the plugin's Go dependencies from the source that ships with the plugin rather than from a remote module proxy. The dependencies declared in `go.mod` must therefore remain vendored under `vendor/`, which is committed alongside the plugin source.
+
+After adding, removing, or updating a dependency, run `go mod tidy && go mod vendor` and commit the resulting `go.mod`, `go.sum`, and `vendor/` changes together. `make check` verifies that the vendored dependencies still match `go.mod`.
+
 ## Local development
 
 For a complete Podman-based development stack with Keycloak, two protected example apps, Makefile targets, and an end-to-end smoke test, see [dev/README.md](dev/README.md). Run `make help` from the repository root to list development and test targets.
