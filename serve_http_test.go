@@ -168,6 +168,75 @@ func TestServeHTTPRenewalCallback303StoresTokens(t *testing.T) {
 	}
 }
 
+func TestServeHTTPRenewalCallbackStoresRefreshExpiry(t *testing.T) {
+	kc := newTestKeycloak(t)
+	kc.tokenBody = `{"access_token":"access","refresh_token":"refresh","expires_in":300,"refresh_expires_in":1800}`
+	auth := newTestMiddleware(t, kc, Config{})
+	rw := httptest.NewRecorder()
+	state := callbackState(t, "https://app.test/x")
+
+	auth.ServeHTTP(rw, newSessionRequest(http.MethodGet, "https://app.test/x?code=abc&state="+state, ""))
+
+	cookies := rw.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("cookies = %v, want one SessionID", cookies)
+	}
+	session, ok := auth.SessionStore.Get(cookies[0].Value)
+	if !ok {
+		t.Fatal("expected stored session for new cookie")
+	}
+	remaining := time.Until(session.RefreshExpiresAt)
+	if remaining < 1795*time.Second || remaining > 1805*time.Second {
+		t.Fatalf("RefreshExpiresAt is %v away, want about 1800s", remaining)
+	}
+}
+
+// Traefik builds one middleware instance per router and rebuilds every
+// instance on each dynamic configuration reload.
+func TestServeHTTPSessionSharedAcrossInstancesOfSameClient(t *testing.T) {
+	kc := newTestKeycloak(t)
+	screen := newTestMiddleware(t, kc, Config{})
+	rw := httptest.NewRecorder()
+	state := callbackState(t, "https://app.test/screen")
+	screen.ServeHTTP(rw, newSessionRequest(http.MethodGet, "https://app.test/screen?code=abc&state="+state, ""))
+	cookies := rw.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != "SessionID" {
+		t.Fatalf("cookies = %v, want one SessionID", cookies)
+	}
+
+	dashboard := newTestMiddleware(t, kc, Config{})
+	next := &capturedNext{}
+	next.install(dashboard)
+	rw = httptest.NewRecorder()
+	req := newSessionRequest(http.MethodGet, "https://app.test/dashboard", cookies[0].Value)
+	apiRequest(req)
+
+	dashboard.ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusOK || !next.called {
+		t.Fatalf("status = %d, next.called = %t; another instance of the same client must accept the session", rw.Code, next.called)
+	}
+	if setCookie := rw.Header().Get("Set-Cookie"); setCookie != "" {
+		t.Fatalf("Set-Cookie = %q, want the shared session cookie left intact", setCookie)
+	}
+}
+
+func TestServeHTTPSessionNotSharedAcrossClients(t *testing.T) {
+	kc := newTestKeycloak(t)
+	issuer := newTestMiddleware(t, kc, Config{})
+	issuer.SessionStore.Set("known", &Session{AccessToken: "a", RefreshToken: "rt", ExpiresAt: time.Now().Add(time.Hour)})
+	other := newTestMiddleware(t, kc, Config{ClientID: "other"})
+	rw := httptest.NewRecorder()
+	req := newSessionRequest(http.MethodGet, "https://app.test/x", "known")
+	apiRequest(req)
+
+	other.ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401; a session issued to one client must not authorize another", rw.Code)
+	}
+}
+
 func TestServeHTTPLegacyCallback307OneHourExpiry(t *testing.T) {
 	kc := newTestKeycloak(t)
 	auth := newTestMiddleware(t, kc, Config{SilentRenewal: boolPtr(false)})

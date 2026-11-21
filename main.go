@@ -179,6 +179,7 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 		session.RefreshToken = tokenResponse.RefreshToken
 		session.ExpiresAt = time.Now().Add(time.Duration(tokenResponse.ExpiresIn) * time.Second)
+		session.RefreshExpiresAt = refreshExpiry(tokenResponse)
 	} else {
 		session.ExpiresAt = time.Now().Add(time.Hour)
 	}
@@ -362,7 +363,17 @@ func (k *keycloakAuth) renewSession(s *Session) error {
 		s.RefreshToken = tokenResponse.RefreshToken
 	}
 	s.ExpiresAt = time.Now().Add(time.Duration(tokenResponse.ExpiresIn) * time.Second)
+	s.RefreshExpiresAt = refreshExpiry(tokenResponse)
 	return nil
+}
+
+// refreshExpiry is zero when Keycloak reports no refresh-token expiry, for
+// example for offline tokens, so such sessions are never evicted as expired.
+func refreshExpiry(tokenResponse *KeycloakTokenResponse) time.Time {
+	if tokenResponse.RefreshExpiresIn <= 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(time.Duration(tokenResponse.RefreshExpiresIn) * time.Second)
 }
 
 func (k *keycloakAuth) redirectToKeycloak(rw http.ResponseWriter, req *http.Request) {
