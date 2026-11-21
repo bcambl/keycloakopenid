@@ -112,8 +112,8 @@ func newOIDCError(kind oidcErrKind, err error) error {
 }
 
 func isOIDCRefusal(err error) bool {
-	var oe *oidcError
-	return errors.As(err, &oe) && oe.kind == oidcErrRefusal
+	oe, ok := err.(*oidcError)
+	return ok && oe.kind == oidcErrRefusal
 }
 
 func newOIDCClient(cfg runtimeConfig) (*oidcClient, error) {
@@ -460,21 +460,40 @@ func (c *oidcClient) checkAuthorizedParty(idToken *validatedIDToken) error {
 	return nil
 }
 
+var accessTokenDigests = map[string]func([]byte) []byte{
+	"RS256": sha256Digest,
+	"PS256": sha256Digest,
+	"ES256": sha256Digest,
+	"RS384": sha384Digest,
+	"PS384": sha384Digest,
+	"ES384": sha384Digest,
+	"RS512": sha512Digest,
+	"PS512": sha512Digest,
+	"ES512": sha512Digest,
+	"EdDSA": sha512Digest,
+}
+
+func sha256Digest(data []byte) []byte {
+	sum := sha256.Sum256(data)
+	return sum[:]
+}
+
+func sha384Digest(data []byte) []byte {
+	sum := sha512.Sum384(data)
+	return sum[:]
+}
+
+func sha512Digest(data []byte) []byte {
+	sum := sha512.Sum512(data)
+	return sum[:]
+}
+
 func verifyAccessTokenHash(accessToken, expected, alg string) error {
-	var digest []byte
-	switch alg {
-	case "RS256", "PS256", "ES256":
-		sum := sha256.Sum256([]byte(accessToken))
-		digest = sum[:]
-	case "RS384", "PS384", "ES384":
-		sum := sha512.Sum384([]byte(accessToken))
-		digest = sum[:]
-	case "RS512", "PS512", "ES512", "EdDSA":
-		sum := sha512.Sum512([]byte(accessToken))
-		digest = sum[:]
-	default:
+	digestFunc, ok := accessTokenDigests[alg]
+	if !ok {
 		return errors.New("oidc: unsupported id token signing algorithm")
 	}
+	digest := digestFunc([]byte(accessToken))
 	actual := base64.RawURLEncoding.EncodeToString(digest[:len(digest)/2])
 	if subtle.ConstantTimeCompare([]byte(actual), []byte(expected)) != 1 {
 		return errors.New("oidc: id token access token hash mismatch")
@@ -542,8 +561,7 @@ func sanitizeOAuthErr(err error) error {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
-	var re *oauth2.RetrieveError
-	if errors.As(err, &re) {
+	if re, ok := err.(*oauth2.RetrieveError); ok {
 		code := re.Response.StatusCode
 		switch {
 		case re.ErrorCode == "invalid_grant":
@@ -554,8 +572,7 @@ func sanitizeOAuthErr(err error) error {
 			return newOIDCError(oidcErrMalformed, fmt.Errorf("oidc: unexpected token endpoint response (status %d)", code))
 		}
 	}
-	var ue *url.Error
-	if errors.As(err, &ue) {
+	if _, ok := err.(*url.Error); ok {
 		return newOIDCError(oidcErrOutage, errors.New("oidc: token endpoint unreachable"))
 	}
 	return newOIDCError(oidcErrMalformed, errors.New("oidc: malformed token response"))

@@ -218,15 +218,21 @@ func validUserHeaderName(name string) bool {
 		return false
 	}
 	for i := 0; i < len(name); i++ {
-		c := name[i]
-		switch {
-		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9':
-		case strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c)):
-		default:
+		if !isUserHeaderTokenByte(name[i]) {
 			return false
 		}
 	}
 	return true
+}
+
+// isUserHeaderTokenByte reports whether c is an RFC 7230 tchar.
+func isUserHeaderTokenByte(c byte) bool {
+	if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' {
+		return true
+	}
+	return c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' ||
+		c == '*' || c == '+' || c == '-' || c == '.' || c == '^' || c == '_' ||
+		c == '`' || c == '|' || c == '~'
 }
 
 func readSecretFiles(config *Config) error {
