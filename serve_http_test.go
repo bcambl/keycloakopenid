@@ -1033,7 +1033,6 @@ func TestSameClientSharing(t *testing.T) {
 
 func TestEquivalentKeycloakURLsShareClientState(t *testing.T) {
 	resetSharedStores()
-	resetSharedLoginStores()
 	p := newOIDCTestProvider(t)
 	first := newAuth(t, p, nil)
 	second := newAuth(t, p, func(c *Config) { c.KeycloakURL = p.srv.URL + "/" })

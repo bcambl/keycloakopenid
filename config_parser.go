@@ -424,9 +424,7 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 		return nil, err
 	}
 
-	sessionStore := sharedSessionStore(clientKey, sessionCapacity)
-	sessionStore.SetCapacity(sessionCapacity)
-	loginStore := sharedLoginStore(clientKey, callbackURL.String())
+	sessionStore, loginStore := acquireSharedStores(uctx, clientKey, sessionCapacity)
 
 	return &keycloakAuth{
 		next:                next,

@@ -88,11 +88,13 @@ The plugin strips the configured user header (default `X-Forwarded-User`) and an
 
 ## Sessions and storage
 
-Sessions are held in memory, inside the Traefik process. They are keyed by the normalized Keycloak URL, realm, and client ID, so every middleware instance configured with the same client shares one store and one `__Host-` cookie.
+Sessions are held in memory, inside the Traefik process. They are keyed by the normalized Keycloak URL, realm, and client ID, so every middleware instance configured with the same client shares one session store and one `__Host-` cookie. Pending login transactions are shared the same way.
 
 - Exactly one Traefik replica is supported. Sessions are process-local and never shared between replicas or persisted.
 - A Traefik restart or replica replacement loses every session; users sign in again.
-- Each per-client store is process-lifetime state, bounded by `SessionCapacity` with least-recently-used eviction.
+- The stores for a client survive ordinary middleware reloads. Each `New` call acquires the shared stores and releases that acquisition when its context is canceled; a reacquisition during the five-minute grace period keeps the existing state.
+- When the last reference to a client is released and no new middleware instance acquires it within five minutes, its stores retire: sessions and pending logins are purged, cleanup workers stop, and later writes fail until a new client is constructed. Traefik does not call a `Close` method on middleware instances; release is driven by the `New` context.
+- Each per-client store is bounded by `SessionCapacity` with least-recently-used eviction.
 - A session ends when Keycloak refuses a refresh (`invalid_grant`); navigation is redirected to Keycloak and API requests receive `401`.
 - Introspection failures answer `502` and leave the session intact. A renewal failure for an active token may let the request proceed with its current access token. A renewal outage for an inactive token, where renewal is forced, answers `502`. Neither outcome deletes the stored session.
 

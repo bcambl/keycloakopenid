@@ -1,6 +1,7 @@
 package keycloakopenid
 
 import (
+	"context"
 	"encoding/base64"
 	"net/http"
 	"net/url"
@@ -13,7 +14,7 @@ import (
 
 func newTestLoginStore(t *testing.T) *loginStore {
 	t.Helper()
-	return newLoginStore("https://app.test/callback", 10)
+	return newLoginStore(10)
 }
 
 func TestBeginUnique256BitValues(t *testing.T) {
@@ -67,9 +68,6 @@ func TestBeginStoresTransaction(t *testing.T) {
 	if tx.returnTarget != "/dashboard?tab=1" {
 		t.Fatalf("tx.returnTarget = %q, want /dashboard?tab=1", tx.returnTarget)
 	}
-	if tx.callbackURI != "https://app.test/callback" {
-		t.Fatalf("tx.callbackURI = %q, want the fixed callback", tx.callbackURI)
-	}
 	remaining := time.Until(tx.expiresAt)
 	if remaining < 9*time.Minute+50*time.Second || remaining > 10*time.Minute+time.Second {
 		t.Fatalf("expiresAt is %v away, want about 10m", remaining)
@@ -119,7 +117,7 @@ func TestConsumeConcurrentReplayExactlyOnce(t *testing.T) {
 }
 
 func TestLoginStoreCapacityEviction(t *testing.T) {
-	store := newLoginStore("https://app.test/callback", 3)
+	store := newLoginStore(3)
 	states := make([]string, 0, 4)
 	for i := 0; i < 4; i++ {
 		s, _, _, err := store.Begin("/x")
@@ -342,12 +340,6 @@ func TestCookieClearMatchesIssuance(t *testing.T) {
 	}
 }
 
-func resetSharedLoginStores() {
-	sharedLoginStoresMu.Lock()
-	defer sharedLoginStoresMu.Unlock()
-	sharedLoginStores = map[string]*loginStore{}
-}
-
 func TestBeginRejectsUnsafeReturnTarget(t *testing.T) {
 	store := newTestLoginStore(t)
 	cases := []struct {
@@ -370,17 +362,35 @@ func TestBeginRejectsUnsafeReturnTarget(t *testing.T) {
 }
 
 func TestSharedLoginStore(t *testing.T) {
-	resetSharedLoginStores()
-	a := sharedLoginStore("client-a", "https://app.test/callback")
-	b := sharedLoginStore("client-a", "https://app.test/callback")
+	resetSharedStores()
+	_, a := acquireSharedStores(context.Background(), "client-a", 10)
+	_, b := acquireSharedStores(context.Background(), "client-a", 10)
 	if a != b {
 		t.Fatal("same client key must resolve to the same login store")
 	}
-	c := sharedLoginStore("client-b", "https://app.test/callback")
+	_, c := acquireSharedStores(context.Background(), "client-b", 10)
 	if a == c {
 		t.Fatal("distinct client keys must resolve to distinct login stores")
 	}
 	if a.capacity != loginCapacity {
 		t.Fatalf("shared login store capacity = %d, want %d", a.capacity, loginCapacity)
+	}
+}
+
+func TestLoginStoreDoesNotRetainCallbackURI(t *testing.T) {
+	store := newLoginStore(10)
+	state, nonce, verifier, err := store.Begin("/dashboard")
+	if err != nil {
+		t.Fatalf("Begin returned error: %v", err)
+	}
+	tx, ok := store.Consume(state)
+	if !ok {
+		t.Fatal("Consume must return the stored transaction")
+	}
+	if tx.nonce != nonce || tx.verifier != verifier || tx.returnTarget != "/dashboard" {
+		t.Fatal("transaction must retain nonce, verifier, and return target")
+	}
+	if _, ok := store.Consume(state); ok {
+		t.Fatal("transaction must remain single use")
 	}
 }

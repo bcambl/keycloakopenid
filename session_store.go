@@ -2,6 +2,7 @@ package keycloakopenid
 
 import (
 	"container/list"
+	"context"
 	"sync"
 	"time"
 )
@@ -81,51 +82,99 @@ func (s *Session) applyTokenSetLocked(ts *tokenSet) {
 	}
 }
 
-var (
-	sharedStoresMu sync.Mutex
-	sharedStores   = map[string]*SessionStore{}
-)
-
-// sessionCleanupInterval is how often each process-global store sweeps expired
-// sessions in the background.
+// sessionCleanupInterval is how often each store sweeps expired sessions in
+// the background.
 const sessionCleanupInterval = time.Minute
 
-var (
-	sharedLoginStoresMu sync.Mutex
-	sharedLoginStores   = map[string]*loginStore{}
-)
+// sharedStoreRetirementGrace is how long an unreferenced client's stores are
+// retained so a configuration reload can reacquire them without losing state.
+const sharedStoreRetirementGrace = 5 * time.Minute
 
-// sharedLoginStore returns the process-wide pending-login store for one
-// Keycloak client, creating it with the fixed per-client capacity on first use.
-// As with sessions, pending logins must survive middleware-instance recreation
-// on configuration reload, so they are shared across instances.
-func sharedLoginStore(key, callbackURI string) *loginStore {
-	sharedLoginStoresMu.Lock()
-	defer sharedLoginStoresMu.Unlock()
-	store, ok := sharedLoginStores[key]
-	if !ok {
-		store = newLoginStore(callbackURI, loginCapacity)
-		sharedLoginStores[key] = store
-	}
-	store.startCleanup()
-	return store
+// sharedClientStores holds the stores shared by every middleware instance for
+// one client.
+type sharedClientStores struct {
+	sessions *SessionStore
+	logins   *loginStore
+	refs     int
+	retire   *time.Timer
 }
 
-// sharedSessionStore returns the process-wide store for one Keycloak client,
-// creating it with the given capacity on first use. Traefik creates a
-// middleware instance per router and recreates every instance on each
-// configuration reload, so sessions must outlive instances. A single cleanup
-// goroutine is started per store.
-func sharedSessionStore(key string, capacity int) *SessionStore {
+var (
+	sharedStoresMu sync.Mutex
+	sharedStores   = map[string]*sharedClientStores{}
+)
+
+// acquireSharedStores returns the stores shared by one client, creating them on
+// first use. Each acquisition is released when ctx is canceled, so a middleware
+// instance's lifetime drives the store reference count.
+func acquireSharedStores(ctx context.Context, key string, sessionCapacity int) (*SessionStore, *loginStore) {
 	sharedStoresMu.Lock()
-	defer sharedStoresMu.Unlock()
-	store, ok := sharedStores[key]
+	entry, ok := sharedStores[key]
 	if !ok {
-		store = NewSessionStore(capacity)
-		sharedStores[key] = store
+		entry = &sharedClientStores{
+			sessions: NewSessionStore(sessionCapacity),
+			logins:   newLoginStore(loginCapacity),
+		}
+		sharedStores[key] = entry
 	}
-	store.startCleanup()
-	return store
+	if entry.retire != nil {
+		entry.retire.Stop()
+		entry.retire = nil
+	}
+	entry.refs++
+	entry.sessions.SetCapacity(sessionCapacity)
+	entry.sessions.startCleanup()
+	entry.logins.startCleanup()
+	sharedStoresMu.Unlock()
+
+	context.AfterFunc(ctx, func() {
+		releaseSharedStores(key, entry)
+	})
+	return entry.sessions, entry.logins
+}
+
+// releaseSharedStores drops one acquisition. The last release schedules
+// retirement after the grace period; reacquisition during that period cancels
+// it.
+func releaseSharedStores(key string, entry *sharedClientStores) {
+	sharedStoresMu.Lock()
+	current, ok := sharedStores[key]
+	if !ok || current != entry || entry.refs <= 0 {
+		sharedStoresMu.Unlock()
+		return
+	}
+	entry.refs--
+	if entry.refs > 0 {
+		sharedStoresMu.Unlock()
+		return
+	}
+	if entry.retire == nil {
+		entry.retire = time.AfterFunc(sharedStoreRetirementGrace, func() {
+			retireSharedStores(key, entry)
+		})
+	}
+	sharedStoresMu.Unlock()
+}
+
+// retireSharedStores removes and closes a client's stores when the registry
+// still holds that exact entry and no references remain. The registry lock is
+// released before the stores are purged.
+func retireSharedStores(key string, entry *sharedClientStores) {
+	sharedStoresMu.Lock()
+	current, ok := sharedStores[key]
+	if !ok || current != entry || entry.refs != 0 {
+		sharedStoresMu.Unlock()
+		return
+	}
+	if entry.retire != nil {
+		entry.retire.Stop()
+		entry.retire = nil
+	}
+	delete(sharedStores, key)
+	sharedStoresMu.Unlock()
+
+	entry.sessions.Close()
+	entry.logins.Close()
 }
 
 // sessionEntry links a stored session to its position in the LRU order.
@@ -144,16 +193,20 @@ type SessionStore struct {
 	order     *list.List
 	byID      map[string]*list.Element
 	startOnce sync.Once
+	closeOnce sync.Once
+	stop      chan struct{}
+	closed    bool
 }
 
 // NewSessionStore returns an empty store with the given capacity. A cleanup
-// goroutine is started separately by sharedSessionStore, never here, so tests
+// goroutine is started separately by acquireSharedStores, never here, so tests
 // can exercise the store without leaving background goroutines behind.
 func NewSessionStore(capacity int) *SessionStore {
 	return &SessionStore{
 		capacity: capacity,
 		order:    list.New(),
 		byID:     make(map[string]*list.Element),
+		stop:     make(chan struct{}),
 	}
 }
 
@@ -166,9 +219,27 @@ func (s *SessionStore) startCleanup() {
 func (s *SessionStore) cleanupLoop(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
-		s.Cleanup(time.Now())
+	for {
+		select {
+		case <-ticker.C:
+			s.Cleanup(time.Now())
+		case <-s.stop:
+			return
+		}
 	}
+}
+
+// Close marks the store closed and clears every entry. A closed store rejects
+// reads and writes. Close is idempotent.
+func (s *SessionStore) Close() {
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		s.order.Init()
+		s.byID = make(map[string]*list.Element)
+		s.mu.Unlock()
+		close(s.stop)
+	})
 }
 
 // SetCapacity adjusts the store's capacity and immediately evicts the least
@@ -176,6 +247,9 @@ func (s *SessionStore) cleanupLoop(interval time.Duration) {
 func (s *SessionStore) SetCapacity(capacity int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
 	s.capacity = capacity
 	s.trim()
 }
@@ -186,6 +260,9 @@ func (s *SessionStore) SetCapacity(capacity int) {
 func (s *SessionStore) Set(id string, session *Session) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
 	if elem, ok := s.byID[id]; ok {
 		elem.Value.(*sessionEntry).session = session
 		s.order.MoveToFront(elem)
@@ -215,6 +292,10 @@ func (s *SessionStore) trim() {
 // most recently used. An expired session is deleted on access.
 func (s *SessionStore) Get(id string) (*Session, bool) {
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil, false
+	}
 	elem, ok := s.byID[id]
 	if !ok {
 		s.mu.Unlock()
@@ -234,6 +315,9 @@ func (s *SessionStore) Get(id string) (*Session, bool) {
 func (s *SessionStore) Delete(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
 	if elem, ok := s.byID[id]; ok {
 		s.order.Remove(elem)
 		delete(s.byID, id)
@@ -252,6 +336,10 @@ type sessionCandidate struct {
 // does not stall the sweep or any request path.
 func (s *SessionStore) Cleanup(now time.Time) {
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
 	candidates := make([]sessionCandidate, 0, len(s.byID))
 	for elem := s.order.Front(); elem != nil; elem = elem.Next() {
 		entry := elem.Value.(*sessionEntry)
@@ -277,6 +365,9 @@ func (s *SessionStore) removeExpired(id string, session *Session, now time.Time)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
 	if elem, ok := s.byID[id]; ok && elem.Value.(*sessionEntry).session == session {
 		s.order.Remove(elem)
 		delete(s.byID, id)

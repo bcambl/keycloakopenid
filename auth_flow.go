@@ -30,7 +30,6 @@ const (
 type loginTransaction struct {
 	nonce        string
 	verifier     string
-	callbackURI  string
 	returnTarget string
 	expiresAt    time.Time
 }
@@ -46,21 +45,23 @@ type loginEntry struct {
 // keyed by state. Transactions are immutable once created, so the store lock
 // alone is enough for atomic single-use consumption.
 type loginStore struct {
-	mu          sync.Mutex
-	capacity    int
-	callbackURI string
-	order       *list.List
-	byState     map[string]*list.Element
-	startOnce   sync.Once
+	mu        sync.Mutex
+	capacity  int
+	order     *list.List
+	byState   map[string]*list.Element
+	startOnce sync.Once
+	closeOnce sync.Once
+	stop      chan struct{}
+	closed    bool
 }
 
-// newLoginStore returns an empty store for one client's fixed callback URI.
-func newLoginStore(callbackURI string, capacity int) *loginStore {
+// newLoginStore returns an empty store with the given capacity.
+func newLoginStore(capacity int) *loginStore {
 	return &loginStore{
-		capacity:    capacity,
-		callbackURI: callbackURI,
-		order:       list.New(),
-		byState:     make(map[string]*list.Element),
+		capacity: capacity,
+		order:    list.New(),
+		byState:  make(map[string]*list.Element),
+		stop:     make(chan struct{}),
 	}
 }
 
@@ -73,9 +74,27 @@ func (l *loginStore) startCleanup() {
 func (l *loginStore) cleanupLoop(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
-		l.Cleanup(time.Now())
+	for {
+		select {
+		case <-ticker.C:
+			l.Cleanup(time.Now())
+		case <-l.stop:
+			return
+		}
 	}
+}
+
+// Close marks the store closed and clears every transaction. A closed store
+// rejects Begin and Consume. Close is idempotent.
+func (l *loginStore) Close() {
+	l.closeOnce.Do(func() {
+		l.mu.Lock()
+		l.closed = true
+		l.order.Init()
+		l.byState = make(map[string]*list.Element)
+		l.mu.Unlock()
+		close(l.stop)
+	})
 }
 
 // Begin creates a new pending login transaction for the given validated
@@ -102,14 +121,16 @@ func (l *loginStore) Begin(returnTarget string) (state, nonce, verifier string, 
 	tx := &loginTransaction{
 		nonce:        nonce,
 		verifier:     verifier,
-		callbackURI:  l.callbackURI,
 		returnTarget: returnTarget,
 		expiresAt:    time.Now().Add(loginLifetime),
 	}
 
 	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return "", "", "", errors.New("login store is closed")
+	}
 	l.setLocked(state, tx)
-	l.mu.Unlock()
 	return state, nonce, verifier, nil
 }
 
@@ -119,6 +140,9 @@ func (l *loginStore) Begin(returnTarget string) (state, nonce, verifier string, 
 func (l *loginStore) Consume(state string) (loginTransaction, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.closed {
+		return loginTransaction{}, false
+	}
 	elem, ok := l.byState[state]
 	if !ok {
 		return loginTransaction{}, false
@@ -161,6 +185,9 @@ func (l *loginStore) trimLocked() {
 func (l *loginStore) Cleanup(now time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.closed {
+		return
+	}
 	for elem := l.order.Front(); elem != nil; {
 		next := elem.Next()
 		if !now.Before(elem.Value.(*loginEntry).tx.expiresAt) {

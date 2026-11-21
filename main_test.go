@@ -145,8 +145,16 @@ func completeLogin(t *testing.T, auth *keycloakAuth, p *oidcTestProvider, return
 
 func resetSharedStores() {
 	sharedStoresMu.Lock()
-	defer sharedStoresMu.Unlock()
-	sharedStores = map[string]*SessionStore{}
+	entries := sharedStores
+	sharedStores = map[string]*sharedClientStores{}
+	sharedStoresMu.Unlock()
+	for _, entry := range entries {
+		if entry.retire != nil {
+			entry.retire.Stop()
+		}
+		entry.sessions.Close()
+		entry.logins.Close()
+	}
 }
 
 func TestPKCEChallenge(t *testing.T) {

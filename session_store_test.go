@@ -1,6 +1,7 @@
 package keycloakopenid
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -439,19 +440,22 @@ func TestSessionApplyTokenSetIdentity(t *testing.T) {
 	})
 }
 
-func TestSharedSessionStoreSameKey(t *testing.T) {
+func TestSharedStoresSameKey(t *testing.T) {
 	resetSharedStores()
-	a := sharedSessionStore("client-a", 5)
-	b := sharedSessionStore("client-a", 7)
-	if a != b {
-		t.Fatal("same client key must resolve to the same store")
+	sessionsA, loginsA := acquireSharedStores(context.Background(), "client-a", 5)
+	sessionsB, loginsB := acquireSharedStores(context.Background(), "client-a", 7)
+	if sessionsA != sessionsB {
+		t.Fatal("same client key must resolve to the same session store")
+	}
+	if loginsA != loginsB {
+		t.Fatal("same client key must resolve to the same login store")
 	}
 }
 
-func TestSharedSessionStoreDistinctKeys(t *testing.T) {
+func TestSharedStoresDistinctKeys(t *testing.T) {
 	resetSharedStores()
-	a := sharedSessionStore("client-a", 5)
-	b := sharedSessionStore("client-b", 5)
+	a, _ := acquireSharedStores(context.Background(), "client-a", 5)
+	b, _ := acquireSharedStores(context.Background(), "client-b", 5)
 	if a == b {
 		t.Fatal("distinct client keys must resolve to distinct stores")
 	}
@@ -459,6 +463,163 @@ func TestSharedSessionStoreDistinctKeys(t *testing.T) {
 	if _, ok := b.Get("id"); ok {
 		t.Fatal("stores for distinct clients must be isolated")
 	}
+}
+
+func waitForSharedRefs(t *testing.T, key string, want int) *sharedClientStores {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		sharedStoresMu.Lock()
+		entry := sharedStores[key]
+		refs := -1
+		if entry != nil {
+			refs = entry.refs
+		}
+		sharedStoresMu.Unlock()
+		if refs == want {
+			return entry
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("shared store %q reached %d references, want %d", key, refs, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestSharedStoresReloadDuringGrace(t *testing.T) {
+	resetSharedStores()
+	key := "client-a"
+	ctx, cancel := context.WithCancel(context.Background())
+	sessions, logins := acquireSharedStores(ctx, key, 10)
+	sessions.Set("session", &Session{AccessToken: "a"})
+	cancel()
+
+	entry := waitForSharedRefs(t, key, 0)
+	if entry.retire == nil {
+		t.Fatal("zero references must schedule retirement")
+	}
+
+	reloadedSessions, reloadedLogins := acquireSharedStores(context.Background(), key, 10)
+	if reloadedSessions != sessions || reloadedLogins != logins {
+		t.Fatal("reacquisition during the grace period must preserve the existing stores")
+	}
+	if entry.retire != nil {
+		t.Fatal("reacquisition must cancel the scheduled retirement")
+	}
+	if _, ok := reloadedSessions.Get("session"); !ok {
+		t.Fatal("reacquisition must retain stored sessions")
+	}
+
+	retireSharedStores(key, entry)
+	if _, ok := reloadedSessions.Get("session"); !ok {
+		t.Fatal("a stopped retirement callback must not purge a reacquired store")
+	}
+}
+
+func TestSharedStoresRetireAfterLastContext(t *testing.T) {
+	resetSharedStores()
+	key := "client-a"
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	firstSessions, firstLogins := acquireSharedStores(firstCtx, key, 10)
+	firstSessions.Set("session", &Session{AccessToken: "a"})
+
+	secondCtx, cancelSecond := context.WithCancel(context.Background())
+	secondSessions, secondLogins := acquireSharedStores(secondCtx, key, 10)
+	if secondSessions != firstSessions || secondLogins != firstLogins {
+		t.Fatal("independent acquisitions must share the same stores")
+	}
+
+	cancelFirst()
+	waitForSharedRefs(t, key, 1)
+	if _, ok := secondSessions.Get("session"); !ok {
+		t.Fatal("canceling one context must not purge state while another reference remains")
+	}
+
+	cancelSecond()
+	entry := waitForSharedRefs(t, key, 0)
+	retireSharedStores(key, entry)
+
+	sharedStoresMu.Lock()
+	_, present := sharedStores[key]
+	sharedStoresMu.Unlock()
+	if present {
+		t.Fatal("retirement must remove the registry entry")
+	}
+	if _, ok := secondSessions.Get("session"); ok {
+		t.Fatal("retirement must clear stored sessions")
+	}
+	if _, _, _, err := secondLogins.Begin("/x"); err == nil {
+		t.Fatal("retirement must reject new login transactions")
+	}
+}
+
+func TestSharedStoresReacquireTimerRace(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		resetSharedStores()
+		key := "client-a"
+		ctx, cancel := context.WithCancel(context.Background())
+		sessions, _ := acquireSharedStores(ctx, key, 10)
+		sessions.Set("session", &Session{AccessToken: "a"})
+		cancel()
+		entry := waitForSharedRefs(t, key, 0)
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		var reacquired *SessionStore
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			retireSharedStores(key, entry)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			reacquired, _ = acquireSharedStores(context.Background(), key, 10)
+		}()
+		close(start)
+		wg.Wait()
+
+		sharedStoresMu.Lock()
+		current := sharedStores[key]
+		sharedStoresMu.Unlock()
+		if current == nil || current.sessions != reacquired {
+			t.Fatalf("iteration %d: registry does not hold the reacquired entry", i)
+		}
+		if reacquired == sessions {
+			if _, ok := reacquired.Get("session"); !ok {
+				t.Fatalf("iteration %d: a reacquired store lost its sessions", i)
+			}
+		}
+	}
+}
+
+func TestClosedStoresRejectReadsAndWrites(t *testing.T) {
+	sessions := NewSessionStore(10)
+	sessions.Set("id", &Session{AccessToken: "a"})
+	sessions.Close()
+	if _, ok := sessions.Get("id"); ok {
+		t.Fatal("closed session store must miss reads")
+	}
+	sessions.Set("new", &Session{AccessToken: "b"})
+	if _, ok := sessions.Get("new"); ok {
+		t.Fatal("closed session store must reject writes")
+	}
+	sessions.Close()
+
+	logins := newLoginStore(10)
+	state, _, _, err := logins.Begin("/x")
+	if err != nil {
+		t.Fatalf("Begin returned error: %v", err)
+	}
+	logins.Close()
+	if _, ok := logins.Consume(state); ok {
+		t.Fatal("closed login store must reject Consume")
+	}
+	if _, _, _, err := logins.Begin("/x"); err == nil {
+		t.Fatal("closed login store must reject Begin")
+	}
+	logins.Close()
 }
 
 func TestSessionStoreCleanupGoroutine(t *testing.T) {
