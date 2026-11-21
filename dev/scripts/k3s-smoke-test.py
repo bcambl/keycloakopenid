@@ -94,6 +94,28 @@ def session_cookie_pair(response):
     return cookie.split(";", 1)[0] if cookie else ""
 
 
+def login_cookie_pair(response):
+    """Return the browser-bound login cookie (name=value) set on response, or "".
+
+    The plugin issues a __Host- login cookie carrying a positive Max-Age on the
+    initial redirect to Keycloak; the callback must echo that cookie back so the
+    plugin can match the callback to its pending transaction. Session cookies
+    carry no Max-Age and clearing cookies carry Max-Age=0/-1, so both are
+    skipped here.
+    """
+    for header in response.headers.get_all("Set-Cookie", []):
+        if not header.startswith("__Host-"):
+            continue
+        max_age = re.search(r"Max-Age=(-?\d+)", header)
+        if not max_age or int(max_age.group(1)) <= 0:
+            continue
+        pair = header.split(";", 1)[0]
+        name, _, value = pair.partition("=")
+        if name and value:
+            return pair
+    return ""
+
+
 def query_of(url):
     return urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
 
@@ -158,6 +180,8 @@ class Demo:
     def login(self, app):
         target = f"/{app}/protected?from=smoke"
         response = request(self.url(target))
+        login_cookie = login_cookie_pair(response)
+        require(login_cookie, f"/{app} did not issue a browser-bound login cookie")
         authorization_url = self.expect_keycloak_redirect(response, app)
         print(f"Unauthenticated /{app} request redirects to Keycloak with the fixed callback")
 
@@ -175,22 +199,24 @@ class Demo:
         record_keycloak_cookies(response)
         require(response.status in (302, 303), f"login failed with HTTP {response.status}")
         print("Alice signs in to Keycloak")
-        return self.finish_callback(response.headers["Location"], app, target)
+        return self.finish_callback(response.headers["Location"], app, target, login_cookie)
 
     def sso(self, app):
         target = f"/{app}/protected"
         response = request(self.url(target))
+        login_cookie = login_cookie_pair(response)
+        require(login_cookie, f"/{app} did not issue a browser-bound login cookie")
         authorization_url = self.expect_keycloak_redirect(response, app)
         response = request(authorization_url, headers={"Cookie": keycloak_cookie_header()})
         record_keycloak_cookies(response)
         require(response.status in (302, 303),
                 f"existing Keycloak login did not complete SSO for {app}; got HTTP {response.status}")
-        return self.finish_callback(response.headers["Location"], app, target)
+        return self.finish_callback(response.headers["Location"], app, target, login_cookie)
 
-    def finish_callback(self, callback, app, target):
+    def finish_callback(self, callback, app, target, login_cookie):
         require(callback.startswith(self.callback_url(app) + "?"),
                 f"Keycloak did not return to the fixed callback {self.callback_url(app)}: {callback}")
-        response = request(callback)
+        response = request(callback, headers={"Cookie": login_cookie})
         require(response.status == 303, f"{app} callback returned {response.status}")
         cookie = session_cookie(response)
         require(cookie, f"{app} did not issue a host-only __Host- session cookie")

@@ -88,6 +88,28 @@ def session_cookie_pair(response):
     return cookie.split(";", 1)[0] if cookie else ""
 
 
+def login_cookie_pair(response):
+    """Return the browser-bound login cookie (name=value) set on response, or "".
+
+    The plugin issues a __Host- login cookie carrying a positive Max-Age on the
+    initial redirect to Keycloak; the callback must echo that cookie back so the
+    plugin can match the callback to its pending transaction. Session cookies
+    carry no Max-Age and clearing cookies carry Max-Age=0/-1, so both are
+    skipped here.
+    """
+    for header in response.headers.get_all("Set-Cookie", []):
+        if not header.startswith("__Host-"):
+            continue
+        max_age = re.search(r"Max-Age=(-?\d+)", header)
+        if not max_age or int(max_age.group(1)) <= 0:
+            continue
+        pair = header.split(";", 1)[0]
+        name, _, value = pair.partition("=")
+        if name and value:
+            return pair
+    return ""
+
+
 def query_of(url):
     return urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
 
@@ -117,6 +139,8 @@ def wait_for_stack():
 def authenticate_first_app():
     response = request("http://helloworld1.localhost:8000/protected?from=smoke")
     require(response.status == 303, f"initial request should redirect to login; got {response.status}")
+    login_cookie = login_cookie_pair(response)
+    require(login_cookie, "plugin did not issue a browser-bound login cookie")
     authorization_url = response.headers["Location"]
     require("/realms/demo/" in authorization_url, "redirect did not target demo realm")
     query = query_of(authorization_url)
@@ -145,7 +169,7 @@ def authenticate_first_app():
 
     callback = response.headers["Location"]
     require("helloworld1.localhost:8000" in callback, "login did not return to helloworld1")
-    response = request(callback)
+    response = request(callback, headers={"Cookie": login_cookie})
     require(response.status == 303, f"authorization callback returned {response.status}")
     cookie = session_cookie(response)
     require(cookie, "plugin did not issue a host-only __Host- session cookie")
@@ -173,6 +197,8 @@ def authenticate_first_app():
 def authenticate_second_app_with_sso():
     response = request("http://helloworld2.localhost:8000/protected")
     require(response.status == 303, f"helloworld2 should redirect to Keycloak; got {response.status}")
+    login_cookie = login_cookie_pair(response)
+    require(login_cookie, "helloworld2 did not issue a browser-bound login cookie")
     query = query_of(response.headers["Location"])
     require(query.get("redirect_uri") == [CALLBACK_URLS["helloworld2.localhost"]],
             "helloworld2 redirect_uri was not its fixed registered callback")
@@ -183,7 +209,7 @@ def authenticate_second_app_with_sso():
     require("helloworld2.localhost:8000" in response.headers.get("Location", ""),
             "SSO did not return to helloworld2")
 
-    response = request(response.headers["Location"])
+    response = request(response.headers["Location"], headers={"Cookie": login_cookie})
     require(response.status == 303, f"helloworld2 callback returned {response.status}")
     session = session_cookie_pair(response)
     require(session, "helloworld2 did not receive its own session cookie")
