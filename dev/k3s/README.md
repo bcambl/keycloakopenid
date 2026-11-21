@@ -51,6 +51,8 @@ make vm-demo-shared    # switch to shared mode and run its smoke test
 
 You can re-run `make vm-up` safely. The first run takes several minutes. It installs packages, k3s and Keycloak, and builds the helloworld image on the VM, so there is no CPU-architecture mismatch with your machine. The demo targets only re-render the routing layer, so switching modes takes seconds.
 
+`make vm-demo-per-app` and `make vm-demo-shared` only render and apply routing resources. Run `make vm-sync` after changing plugin source so Traefik reloads it, and run `make vm-up` after changing the Keycloak realm or other deployment manifests so the affected workload rolls out.
+
 ### Browser walkthrough
 
 1. Open `https://$VM_HOST/helloworld1/`. Accept the self-signed certificate warning once for this host.
