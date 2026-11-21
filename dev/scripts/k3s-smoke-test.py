@@ -158,7 +158,7 @@ def session_cookie_expired(response, name):
     return False
 
 
-def revoke_alice_sessions(keycloak_base):
+def admin_access_token(keycloak_base):
     credentials = urllib.parse.urlencode(
         {
             "grant_type": "password",
@@ -175,6 +175,28 @@ def revoke_alice_sessions(keycloak_base):
     admin = json.loads(response.read().decode())
     token = admin.get("access_token")
     require(isinstance(token, str) and token, "admin token response did not include access_token")
+    return token
+
+
+def realm_access_token_lifespan(keycloak_base):
+    token = admin_access_token(keycloak_base)
+    response = request(
+        keycloak_base + "/admin/realms/demo",
+        headers={"Authorization": "Bearer " + token},
+    )
+    require(response.status == 200, f"realm lookup returned {response.status}")
+    realm = json.loads(response.read().decode())
+    lifespan = realm.get("accessTokenLifespan")
+    require(isinstance(lifespan, int) and lifespan > 0, "realm has no valid accessTokenLifespan")
+    require(
+        lifespan == 10,
+        f"demo realm accessTokenLifespan is {lifespan}, not 10; recreate Keycloak so the realm is re-imported",
+    )
+    return lifespan
+
+
+def revoke_alice_sessions(keycloak_base):
+    token = admin_access_token(keycloak_base)
     authorization = {"Authorization": "Bearer " + token}
 
     response = request(
@@ -367,6 +389,7 @@ class Demo:
         print("An invalid session cookie redirects to Keycloak")
 
     def check_token_lifecycle(self, session):
+        realm_access_token_lifespan(self.base + "/auth")
         protected = self.url("/helloworld1/protected")
         response = request(protected, headers={"Cookie": session})
         body = response.read().decode()

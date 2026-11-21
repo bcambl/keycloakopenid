@@ -18,7 +18,7 @@ make up
 
 Run `make help` to list all available development, Go check, and stack-management targets. The default `COMPOSE` command is `podman compose -f podman-compose.yml`; override `COMPOSE` if your Podman Compose provider needs a different invocation.
 
-Keycloak imports `dev/keycloak/demo-realm.json` when its data directory is empty. Wait for Keycloak and Traefik to finish starting before opening the apps:
+Keycloak imports `dev/keycloak/demo-realm.json` when its data directory is empty. After changing realm settings, recreate the Keycloak container so the realm is imported again (`make down && make demo`); the smoke test verifies the running realm's access-token lifetime and reports an actionable error when a pre-existing container still carries the old settings. Wait for Keycloak and Traefik to finish starting before opening the apps:
 
 - [helloworld1](http://helloworld1.localhost:8000)
 - [helloworld2](http://helloworld2.localhost:8000)
