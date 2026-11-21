@@ -127,9 +127,58 @@ func TestCallbackProcessedBeforeExistingSession(t *testing.T) {
 	if cap.called {
 		t.Fatal("callback path must be processed before existing sessions, not forwarded")
 	}
-	// With no code/state the callback restarts a login, never forwards.
-	if rw.Code != http.StatusSeeOther {
-		t.Fatalf("status = %d, want 303 login restart", rw.Code)
+	// With no code/state the callback fails closed rather than forwarding or
+	// starting a login.
+	if rw.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a callback with no code/state", rw.Code)
+	}
+}
+
+// TestCallbackMissingCodeReturns400 proves a callback without a code answers
+// 400 even for a navigation request, without redirecting or creating a login.
+func TestCallbackMissingCodeReturns400(t *testing.T) {
+	p := newOIDCTestProvider(t)
+	auth := newAuth(t, p, nil)
+
+	rw := httptest.NewRecorder()
+	req := navigationGet("https://app.test/callback?state=whatever")
+	auth.ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (no code)", rw.Code)
+	}
+	if loc := rw.Header().Get("Location"); loc != "" {
+		t.Fatalf("Location = %q, want no redirect for a missing-code callback", loc)
+	}
+	auth.loginStore.mu.Lock()
+	n := len(auth.loginStore.byState)
+	auth.loginStore.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("login store holds %d transactions, want none created for a missing-code callback", n)
+	}
+}
+
+// TestCallbackMissingStateReturns400 proves a callback without a state answers
+// 400 for an API request, without creating a login.
+func TestCallbackMissingStateReturns400(t *testing.T) {
+	p := newOIDCTestProvider(t)
+	auth := newAuth(t, p, nil)
+
+	rw := httptest.NewRecorder()
+	req := apiGet("https://app.test/callback?code=CODE")
+	auth.ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (no state)", rw.Code)
+	}
+	if loc := rw.Header().Get("Location"); loc != "" {
+		t.Fatalf("Location = %q, want no redirect for a missing-state callback", loc)
+	}
+	auth.loginStore.mu.Lock()
+	n := len(auth.loginStore.byState)
+	auth.loginStore.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("login store holds %d transactions, want none created for a missing-state callback", n)
 	}
 }
 

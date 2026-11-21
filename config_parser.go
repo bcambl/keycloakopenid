@@ -100,6 +100,9 @@ func validateCallbackURL(raw string) (*url.URL, error) {
 	if u.Host == "" {
 		return nil, errors.New("invalid callback url: missing host")
 	}
+	if u.Path == "" {
+		return nil, errors.New("invalid callback url: missing path")
+	}
 	if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
 		return nil, errors.New("callback url must use https except on loopback")
 	}

@@ -204,6 +204,8 @@ func TestValidateCallbackURL(t *testing.T) {
 		{"http localhost", "http://localhost/cb", false},
 		{"http subdomain localhost", "http://helloworld1.localhost/cb", false},
 		{"http non-loopback", "http://app.test/cb", true},
+		{"https empty path", "https://app.test", true},
+		{"https root path", "https://app.test/", false},
 		{"empty", "", true},
 		{"ftp", "ftp://app.test/cb", true},
 		{"no scheme", "app.test/cb", true},

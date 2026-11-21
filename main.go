@@ -135,7 +135,7 @@ func (k *keycloakAuth) handleCallback(rw http.ResponseWriter, req *http.Request)
 
 	code := req.URL.Query().Get("code")
 	if code == "" || state == "" {
-		k.startLogin(rw, req)
+		k.writeBadRequest(rw)
 		return
 	}
 
