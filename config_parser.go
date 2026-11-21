@@ -10,47 +10,54 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
-	KeycloakURL        string `json:"url"`
-	InsecureSkipVerify bool   `json:"insecure_skip_verify"`
-	ClientID           string `json:"client_id"`
-	ClientSecret       string `json:"client_secret"`
-	KeycloakRealm      string `json:"keycloak_realm"`
-	Scope              string `json:"scope"`
-	UseAuthHeader      bool   `json:"use_auth_header"`
-	UserClaimName      string `json:"user_claim_name"`
-	UserHeaderName     string `json:"user_header_name"`
-	IgnorePathPrefixes string `json:"ignore_path_prefixes"`
-	LegacySupport      bool   `json:"legacy_support"`
+	KeycloakURL         string `json:"url"`
+	InsecureSkipVerify  bool   `json:"insecure_skip_verify"`
+	ClientID            string `json:"client_id"`
+	ClientSecret        string `json:"client_secret"`
+	KeycloakRealm       string `json:"keycloak_realm"`
+	Scope               string `json:"scope"`
+	UseAuthHeader       bool   `json:"use_auth_header"`
+	UserClaimName       string `json:"user_claim_name"`
+	UserHeaderName      string `json:"user_header_name"`
+	IgnorePathPrefixes  string `json:"ignore_path_prefixes"`
+	LegacySupport       bool   `json:"legacy_support"`
+	SilentRenewal       *bool  `json:"silent_renewal"`
+	RefreshBeforeExpiry string `json:"refresh_before_expiry"`
 
-	ClientIDFile          string `json:"client_id_file"`
-	ClientSecretFile      string `json:"client_secret_file"`
-	KeycloakURLEnv        string `json:"url_env"`
-	InsecureSkipVerifyEnv string `json:"insecure_skip_verify_env"`
-	ClientIDEnv           string `json:"client_id_env"`
-	ClientSecretEnv       string `json:"client_secret_env"`
-	KeycloakRealmEnv      string `json:"keycloak_realm_env"`
-	ScopeEnv              string `json:"scope_env"`
-	UseAuthHeaderEnv      string `json:"use_auth_header_env"`
-	IgnorePathPrefixesEnv string `json:"ignore_path_prefixes_env"`
-	LegacySupportEnv      string `json:"legacy_support_env"`
+	ClientIDFile           string `json:"client_id_file"`
+	ClientSecretFile       string `json:"client_secret_file"`
+	KeycloakURLEnv         string `json:"url_env"`
+	InsecureSkipVerifyEnv  string `json:"insecure_skip_verify_env"`
+	ClientIDEnv            string `json:"client_id_env"`
+	ClientSecretEnv        string `json:"client_secret_env"`
+	KeycloakRealmEnv       string `json:"keycloak_realm_env"`
+	ScopeEnv               string `json:"scope_env"`
+	UseAuthHeaderEnv       string `json:"use_auth_header_env"`
+	IgnorePathPrefixesEnv  string `json:"ignore_path_prefixes_env"`
+	LegacySupportEnv       string `json:"legacy_support_env"`
+	SilentRenewalEnv       string `json:"silent_renewal_env"`
+	RefreshBeforeExpiryEnv string `json:"refresh_before_expiry_env"`
 }
 
 type keycloakAuth struct {
-	next               http.Handler
-	KeycloakURL        *url.URL
-	InsecureSkipVerify bool
-	ClientID           string
-	ClientSecret       string
-	KeycloakRealm      string
-	Scope              string
-	UseAuthHeader      bool
-	UserClaimName      string
-	UserHeaderName     string
-	IgnorePathPrefixes []string
-	SessionStore       *SessionStore
+	next                http.Handler
+	KeycloakURL         *url.URL
+	InsecureSkipVerify  bool
+	ClientID            string
+	ClientSecret        string
+	KeycloakRealm       string
+	Scope               string
+	UseAuthHeader       bool
+	UserClaimName       string
+	UserHeaderName      string
+	IgnorePathPrefixes  []string
+	SessionStore        *SessionStore
+	SilentRenewal       bool
+	RefreshBeforeExpiry time.Duration
 }
 
 type KeycloakTokenResponse struct {
@@ -171,6 +178,24 @@ func readConfigEnv(config *Config) error {
 		}
 		config.IgnorePathPrefixes = strings.TrimSpace(ignorePathPrefixes)
 	}
+	if config.SilentRenewalEnv != "" {
+		silentRenewal := os.Getenv(config.SilentRenewalEnv)
+		if silentRenewal == "" {
+			return errors.New("SilentRenewalEnv referenced but NOT set")
+		}
+		silentRenewalBool, err := strconv.ParseBool(silentRenewal)
+		if err != nil {
+			return err
+		}
+		config.SilentRenewal = &silentRenewalBool
+	}
+	if config.RefreshBeforeExpiryEnv != "" {
+		refreshBeforeExpiry := os.Getenv(config.RefreshBeforeExpiryEnv)
+		if refreshBeforeExpiry == "" {
+			return errors.New("RefreshBeforeExpiryEnv referenced but NOT set")
+		}
+		config.RefreshBeforeExpiry = strings.TrimSpace(refreshBeforeExpiry)
+	}
 	if config.LegacySupportEnv != "" {
 		legacySupport := os.Getenv(config.LegacySupportEnv)
 		if legacySupport == "" {
@@ -217,6 +242,19 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 		config.Scope = "openid"
 	}
 
+	if config.RefreshBeforeExpiry == "" {
+		config.RefreshBeforeExpiry = "30s"
+	}
+	refreshBeforeExpiry := 30 * time.Second
+	silentRenewal := config.SilentRenewal == nil || *config.SilentRenewal
+	if silentRenewal {
+		parsed, err := time.ParseDuration(config.RefreshBeforeExpiry)
+		if err != nil {
+			return nil, err
+		}
+		refreshBeforeExpiry = parsed
+	}
+
 	useAuthHeader := false
 	if config.UseAuthHeader {
 		useAuthHeader = true
@@ -238,18 +276,20 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 	}
 
 	return &keycloakAuth{
-		next:               next,
-		KeycloakURL:        keycloakURL,
-		InsecureSkipVerify: config.InsecureSkipVerify,
-		ClientID:           config.ClientID,
-		ClientSecret:       config.ClientSecret,
-		KeycloakRealm:      config.KeycloakRealm,
-		Scope:              config.Scope,
-		UseAuthHeader:      useAuthHeader,
-		UserClaimName:      userClaimName,
-		UserHeaderName:     userHeaderName,
-		IgnorePathPrefixes: ignorePathPrefixes,
-		SessionStore:       NewSessionStore(),
+		next:                next,
+		KeycloakURL:         keycloakURL,
+		InsecureSkipVerify:  config.InsecureSkipVerify,
+		ClientID:            config.ClientID,
+		ClientSecret:        config.ClientSecret,
+		KeycloakRealm:       config.KeycloakRealm,
+		Scope:               config.Scope,
+		UseAuthHeader:       useAuthHeader,
+		UserClaimName:       userClaimName,
+		UserHeaderName:      userHeaderName,
+		IgnorePathPrefixes:  ignorePathPrefixes,
+		SessionStore:        NewSessionStore(),
+		SilentRenewal:       silentRenewal,
+		RefreshBeforeExpiry: refreshBeforeExpiry,
 	}, nil
 }
 

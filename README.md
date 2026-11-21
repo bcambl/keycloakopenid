@@ -62,6 +62,8 @@ http:
           Scope: "<Scope [space deliminated] (default: 'openid', example: 'openid profile email')"
           TokenCookieName: "<TOKEN_COOKIE_NAME (default: 'AUTH_TOKEN')"
           UseAuthHeader: "<true|false (default: false)"
+          SilentRenewal: "<true|false (default: true)>"
+          RefreshBeforeExpiry: "<duration (default: '30s', example: '45s')>"
           IgnorePathPrefixes: "/api,/favicon.ico [comma deliminated] (optional)"
 ```
 
@@ -97,6 +99,8 @@ http:
           ScopeEnv: "SCOPE [space deliminated] (default: 'openid', example: 'openid profile email')"
           TokenCookieNameEnv: "TOKEN_COOKIE_NAME (default: 'AUTH_TOKEN')"
           UseAuthHeaderEnv: "USE_AUTH_HEADER (default: false)"
+          SilentRenewalEnv: "SILENT_RENEWAL (default: true)"
+          RefreshBeforeExpiryEnv: "REFRESH_BEFORE_EXPIRY (default: '30s')"
 ```
 
 This plugin also sets a header with a claim from Keycloak, as it has become reasonably common. Claim name and header name can be modified.  
@@ -118,6 +122,23 @@ http:
           UserClaimName: "my-uncommon-claim"
           UserHeaderName: "X-Custom-Header"
 ```
+
+## Silent renewal
+
+Silent renewal is on by default. The plugin keeps a user's session alive for as long as Keycloak allows, without any user interruption:
+
+- After the Keycloak callback, the session stores the access token, the refresh token, and the access token expiry.
+- On each request the access token is introspected as usual. When it is within `RefreshBeforeExpiry` of its expiry, or already inactive, the plugin renews it with the refresh-token grant and continues the request with the new token. No redirect happens.
+- Renewals are serialized per session and rotated refresh tokens are stored, so concurrent requests are safe.
+- Only when Keycloak refuses the refresh (`invalid_grant`), meaning the Keycloak session is over, does the session end: browser navigation is redirected to the Keycloak login with a 303, and fetch/XHR requests receive a 401 with `{"error":"authentication_required"}` and no redirect, so the application can reload the current page in the same tab.
+- A Keycloak outage is never treated as a session end: introspection or renewal transport failures answer 502 and leave the session intact. A renewal failure while the current access token is still active lets the request proceed with that token.
+- The hard-coded one-hour session lifetime is not used in this mode; Keycloak's SSO and client session settings decide how long a user stays logged in.
+
+Requirements and limitations:
+
+- The Keycloak token response must contain a `refresh_token` (the default for the standard flow with confidential clients). If it is missing, the callback fails with an error so the misconfiguration is visible.
+- Sessions stay in memory per plugin instance. A Traefik restart means users sign in again. Run a single Traefik instance or use sticky sessions; multiple non-sticky replicas would race refresh-token rotation and force repeated logins.
+- With `SilentRenewal: false`, the legacy behavior is used instead: one-hour session lifetime, introspection per request, and 307 redirects. Use this opt-out if you want the old behavior, for example to force periodic re-authentication.
 
 ## Local development
 

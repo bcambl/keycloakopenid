@@ -36,6 +36,8 @@ def request(url, data=None, headers=None):
     headers = dict(headers or {})
     parsed = urllib.parse.urlsplit(url)
     if parsed.hostname in APP_HOSTS:
+        headers.setdefault("Accept", "text/html")
+        headers.setdefault("Sec-Fetch-Mode", "navigate")
         headers.setdefault("Host", parsed.netloc)
         url = urllib.parse.urlunsplit(
             ("http", "127.0.0.1:8000", parsed.path, parsed.query, parsed.fragment)
@@ -81,7 +83,7 @@ def wait_for_stack():
 
 def authenticate_first_app():
     response = request("http://helloworld1.localhost:8000/protected?from=smoke")
-    require(response.status == 307, f"initial request should redirect to login; got {response.status}")
+    require(response.status == 303, f"initial request should redirect to login; got {response.status}")
     authorization_url = response.headers["Location"]
     require("/realms/demo/" in authorization_url, "redirect did not target demo realm")
     print("Unauthenticated request redirects to Keycloak")
@@ -108,7 +110,7 @@ def authenticate_first_app():
     callback = response.headers["Location"]
     require("helloworld1.localhost:8000" in callback, "login did not return to helloworld1")
     response = request(callback)
-    require(response.status == 307, f"authorization callback returned {response.status}")
+    require(response.status == 303, f"authorization callback returned {response.status}")
     cookie = response.headers.get("Set-Cookie", "")
     require("SessionID=" in cookie and "Secure" in cookie and "HttpOnly" in cookie,
             "plugin did not issue a Secure, HttpOnly session cookie")
@@ -130,7 +132,7 @@ def authenticate_first_app():
 
 def authenticate_second_app_with_sso():
     response = request("http://helloworld2.localhost:8000/protected")
-    require(response.status == 307, f"helloworld2 should redirect to Keycloak; got {response.status}")
+    require(response.status == 303, f"helloworld2 should redirect to Keycloak; got {response.status}")
     response = request(response.headers["Location"], headers={"Cookie": keycloak_cookie_header()})
     record_keycloak_cookies(response)
     require(response.status in (302, 303),
@@ -139,7 +141,7 @@ def authenticate_second_app_with_sso():
             "SSO did not return to helloworld2")
 
     response = request(response.headers["Location"])
-    require(response.status == 307, f"helloworld2 callback returned {response.status}")
+    require(response.status == 303, f"helloworld2 callback returned {response.status}")
     cookie = response.headers.get("Set-Cookie", "")
     require("SessionID=" in cookie, "helloworld2 did not receive its own session cookie")
     destination = response.headers["Location"]
@@ -163,7 +165,7 @@ def main():
 
     response = request("http://helloworld1.localhost:8000/protected",
                        headers={"Cookie": "SessionID=invalid"})
-    require(response.status == 307, f"invalid session should redirect; got {response.status}")
+    require(response.status == 303, f"invalid session should redirect; got {response.status}")
     print("Invalid session is rejected")
 
     response = request("http://helloworld1.localhost:8000/favicon.ico")
