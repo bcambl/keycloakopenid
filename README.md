@@ -60,13 +60,17 @@ Or from environment variables:
 | `SessionCapacity` | `10000` | Maximum number of sessions held per configured client. Least-recently-used sessions are evicted beyond this bound. |
 | `UseAuthHeader` | `false` | Also set the bearer access token in the `Authorization` header. |
 | `UserClaimName` | `preferred_username` | ID-token claim forwarded as the user identity. |
-| `UserHeaderName` | `X-Forwarded-User` | Header the user identity is written to. |
-| `IgnorePathPrefixes` | none | Comma-delimited path prefixes that bypass authentication. Matched by path segment, not substring. |
+| `UserHeaderName` | `X-Forwarded-User` | Header the user identity is written to. Must be a valid RFC 7230 header field name and must not be `Authorization`. |
+| `IgnorePathPrefixes` | none | Comma-delimited path prefixes that bypass authentication. Matched by path segment, not substring. Trailing slashes are removed, so `/api/` behaves as `/api`. |
 | `LegacySupport` | `false` | Probe for an older Keycloak instance that serves realms under `/auth`. |
-| `RefreshBeforeExpiry` | `30s` | How close to access-token expiry a session is renewed. |
+| `RefreshBeforeExpiry` | `30s` | How close to access-token expiry a session is renewed. Must not be negative. |
 | `InsecureSkipVerify` | `false` | Skip TLS verification of the Keycloak connection. For development only. |
 
 `KeycloakURL`, `InsecureSkipVerify`, `ClientID`, `ClientSecret`, `KeycloakRealm`, `Scope`, `UseAuthHeader`, `IgnorePathPrefixes`, `LegacySupport`, and `RefreshBeforeExpiry` each also accept an `...Env` variant. `CallbackURL` and `SessionCapacity` are set directly only.
+
+Every referenced environment variable must be set and non-empty. Boolean variables parse with Go's boolean syntax (`true`, `false`, `1`, `0`, and their variants); a missing, empty, or malformed value is a configuration error. Environment values take precedence over directly configured values, so a valid `UseAuthHeaderEnv: "false"` overrides `UseAuthHeader: true`.
+
+Warning: an ignore prefix of `/` matches every valid absolute path and therefore disables authentication for every request routed through that middleware. Use it only on a router that must remain fully public.
 
 ### CallbackURL registration
 
@@ -101,7 +105,7 @@ This middleware authenticates and identifies the user. It does not authorize. `X
 - The authorization-cookie behavior is removed. `UseAuthHeader` controls whether the bearer token is forwarded in the `Authorization` header.
 - The client-credentials grant is removed. Authentication always uses the authorization-code flow.
 - `SilentRenewal` and the one-hour legacy session are removed. The plugin always renews with the refresh token as described above, and uses 303 redirects, never 307.
-- `IgnorePathPrefixes` now matches by path segment (`/healthz` matches `/healthz` and `/healthz/...`), not by substring.
+- `IgnorePathPrefixes` now matches by path segment (`/healthz` matches `/healthz` and `/healthz/...`), not by substring. Trailing slashes are removed, and `/` disables authentication for every path on the router.
 - `CallbackURL` is now required and must be registered on the Keycloak client. Existing deployments must add it and update their client redirect URIs.
 - `LegacySupport` no longer changes session behavior; it only probes for an older Keycloak `/auth` prefix. Remove it unless you target such an instance.
 

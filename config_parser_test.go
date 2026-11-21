@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -32,11 +33,14 @@ func newTestAuth(t *testing.T, config *Config) *keycloakAuth {
 	return auth
 }
 
-func newConfigError(t *testing.T, config *Config) {
+func newConfigError(t *testing.T, config *Config, want string) {
 	t.Helper()
 	_, err := New(context.Background(), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), config, "test")
 	if err == nil {
 		t.Fatal("New returned nil error, want error")
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("New error = %q, want it to contain %q", err, want)
 	}
 }
 
@@ -57,7 +61,7 @@ func newProviderAuth(t *testing.T, mutate func(*Config)) *keycloakAuth {
 func TestConfigRequiresCallbackURL(t *testing.T) {
 	config := testConfig()
 	config.CallbackURL = ""
-	newConfigError(t, config)
+	newConfigError(t, config, "callback")
 }
 
 func TestConfigRequiresClientSecret(t *testing.T) {
@@ -66,7 +70,7 @@ func TestConfigRequiresClientSecret(t *testing.T) {
 	config.KeycloakURL = p.srv.URL
 	config.ClientID = p.clientID
 	config.ClientSecret = ""
-	newConfigError(t, config)
+	newConfigError(t, config, "invalid configuration")
 }
 
 func TestConfigDefaultSessionCapacity(t *testing.T) {
@@ -79,13 +83,13 @@ func TestConfigDefaultSessionCapacity(t *testing.T) {
 func TestConfigZeroSessionCapacityRejected(t *testing.T) {
 	config := testConfig()
 	config.SessionCapacity = 0
-	newConfigError(t, config)
+	newConfigError(t, config, "session capacity")
 }
 
 func TestConfigNegativeSessionCapacityRejected(t *testing.T) {
 	config := testConfig()
 	config.SessionCapacity = -1
-	newConfigError(t, config)
+	newConfigError(t, config, "session capacity")
 }
 
 func TestConfigPositiveSessionCapacityAccepted(t *testing.T) {
@@ -112,7 +116,7 @@ func TestConfigRefreshWindowParsed(t *testing.T) {
 func TestConfigInvalidRefreshWindowRejected(t *testing.T) {
 	config := testConfig()
 	config.RefreshBeforeExpiry = "nope"
-	newConfigError(t, config)
+	newConfigError(t, config, "RefreshBeforeExpiry")
 }
 
 func TestEnsureOpenIDScope(t *testing.T) {
@@ -147,13 +151,13 @@ func TestConfigIgnorePathPrefixesTrimmed(t *testing.T) {
 func TestConfigIgnorePathPrefixesRejectEmpty(t *testing.T) {
 	config := testConfig()
 	config.IgnorePathPrefixes = "/api,,/favicon.ico"
-	newConfigError(t, config)
+	newConfigError(t, config, "ignore path prefix")
 }
 
 func TestConfigIgnorePathPrefixesRejectMalformed(t *testing.T) {
 	config := testConfig()
 	config.IgnorePathPrefixes = "api"
-	newConfigError(t, config)
+	newConfigError(t, config, "ignore path prefix")
 }
 
 func TestParseURLSchemes(t *testing.T) {
@@ -204,7 +208,7 @@ func TestCanonicalKeycloakURL(t *testing.T) {
 func TestCallbackURLHTTPSRequired(t *testing.T) {
 	config := testConfig()
 	config.CallbackURL = "http://app.test/callback"
-	newConfigError(t, config)
+	newConfigError(t, config, "https")
 }
 
 func TestCallbackURLLoopbackHTTPAllowed(t *testing.T) {
@@ -225,7 +229,7 @@ func TestCallbackURLHTTPSAllowed(t *testing.T) {
 func TestCallbackURLRejectsNonHTTPScheme(t *testing.T) {
 	config := testConfig()
 	config.CallbackURL = "ftp://app.test/cb"
-	newConfigError(t, config)
+	newConfigError(t, config, "callback url scheme")
 }
 
 func TestValidateCallbackURL(t *testing.T) {
@@ -309,5 +313,124 @@ func TestConfigCustomUserHeaderAndClaim(t *testing.T) {
 	}
 	if auth.UserClaimName != "email" {
 		t.Fatalf("UserClaimName = %q, want email", auth.UserClaimName)
+	}
+}
+
+func TestConfigUserHeaderNameValidation(t *testing.T) {
+	valid := []string{"X-Forwarded-User", "x-custom-user", "X_Custom!", "X-123"}
+	for _, name := range valid {
+		t.Run("valid "+name, func(t *testing.T) {
+			auth := newProviderAuth(t, func(c *Config) { c.UserHeaderName = name })
+			if auth.UserHeaderName != name {
+				t.Fatalf("UserHeaderName = %q, want %q", auth.UserHeaderName, name)
+			}
+		})
+	}
+
+	invalid := []string{"", "Authorization", "authorization", "Bad Header", "Bad:Header", "Bad\rHeader", "X-É"}
+	for _, name := range invalid {
+		t.Run("invalid "+name, func(t *testing.T) {
+			if validUserHeaderName(name) {
+				t.Fatalf("validUserHeaderName(%q) = true, want false", name)
+			}
+		})
+	}
+
+	for _, name := range invalid[1:] {
+		t.Run("reject "+name, func(t *testing.T) {
+			for _, useAuthHeader := range []bool{false, true} {
+				p := newOIDCTestProvider(t)
+				config := testConfig()
+				config.KeycloakURL = p.srv.URL
+				config.ClientID = p.clientID
+				config.UserHeaderName = name
+				config.UseAuthHeader = useAuthHeader
+				newConfigError(t, config, "user header")
+			}
+		})
+	}
+}
+
+func TestConfigUseAuthHeaderEnvStrict(t *testing.T) {
+	cases := []struct {
+		name    string
+		envName string
+		set     bool
+		value   string
+		wantErr bool
+		want    bool
+	}{
+		{"unset", "TEST_USE_AUTH_HEADER_UNSET", false, "", true, true},
+		{"empty", "TEST_USE_AUTH_HEADER_EMPTY", true, "", true, true},
+		{"malformed", "TEST_USE_AUTH_HEADER_MALFORMED", true, "not-a-bool", true, true},
+		{"false", "TEST_USE_AUTH_HEADER_FALSE", true, "false", false, false},
+		{"true", "TEST_USE_AUTH_HEADER_TRUE", true, "true", false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.envName, tc.value)
+			if !tc.set {
+				if err := os.Unsetenv(tc.envName); err != nil {
+					t.Fatalf("os.Unsetenv returned error: %v", err)
+				}
+			}
+
+			p := newOIDCTestProvider(t)
+			config := testConfig()
+			config.KeycloakURL = p.srv.URL
+			config.ClientID = p.clientID
+			config.UseAuthHeader = true
+			config.UseAuthHeaderEnv = tc.envName
+
+			if tc.wantErr {
+				newConfigError(t, config, tc.envName)
+				return
+			}
+			auth := newTestAuth(t, config)
+			if auth.UseAuthHeader != tc.want {
+				t.Fatalf("UseAuthHeader = %t, want %t", auth.UseAuthHeader, tc.want)
+			}
+		})
+	}
+}
+
+func TestConfigRejectsNegativeRefreshWindow(t *testing.T) {
+	p := newOIDCTestProvider(t)
+	config := testConfig()
+	config.KeycloakURL = p.srv.URL
+	config.ClientID = p.clientID
+	config.RefreshBeforeExpiry = "-1s"
+	newConfigError(t, config, "RefreshBeforeExpiry")
+
+	config = testConfig()
+	config.KeycloakURL = p.srv.URL
+	config.ClientID = p.clientID
+	config.RefreshBeforeExpiry = "0s"
+	auth := newTestAuth(t, config)
+	if auth.RefreshBeforeExpiry != 0 {
+		t.Fatalf("RefreshBeforeExpiry = %v, want 0s", auth.RefreshBeforeExpiry)
+	}
+}
+
+func TestIgnorePathPrefixesNormalizeTrailingSlashes(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want []string
+	}{
+		{"/api/,/healthz//", []string{"/api", "/healthz"}},
+		{"/", []string{"/"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.raw, func(t *testing.T) {
+			auth := newProviderAuth(t, func(c *Config) { c.IgnorePathPrefixes = tc.raw })
+			if len(auth.IgnorePathPrefixes) != len(tc.want) {
+				t.Fatalf("IgnorePathPrefixes = %v, want %v", auth.IgnorePathPrefixes, tc.want)
+			}
+			for i := range tc.want {
+				if auth.IgnorePathPrefixes[i] != tc.want[i] {
+					t.Fatalf("IgnorePathPrefixes[%d] = %q, want %q", i, auth.IgnorePathPrefixes[i], tc.want[i])
+				}
+			}
+		})
 	}
 }

@@ -185,9 +185,33 @@ func parseIgnorePathPrefixes(raw string) ([]string, error) {
 		if !strings.HasPrefix(part, "/") {
 			return nil, fmt.Errorf("invalid ignore path prefix %q: must start with /", part)
 		}
+		if part != "/" {
+			part = strings.TrimRight(part, "/")
+			if part == "" {
+				return nil, errors.New("invalid ignore path prefix: empty entry")
+			}
+		}
 		prefixes = append(prefixes, part)
 	}
 	return prefixes, nil
+}
+
+// validUserHeaderName reports whether name is an RFC 7230 token usable as an
+// HTTP header field name. Authorization is reserved for validated sessions.
+func validUserHeaderName(name string) bool {
+	if name == "" || strings.EqualFold(name, "Authorization") {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		case strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c)):
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func readSecretFiles(config *Config) error {
@@ -264,10 +288,16 @@ func readConfigEnv(config *Config) error {
 	if config.UseAuthHeaderEnv != "" {
 		useAuthHeader, exists := os.LookupEnv(config.UseAuthHeaderEnv)
 		if !exists {
-			useAuthHeader = "false"
+			return fmt.Errorf("UseAuthHeaderEnv %q referenced but NOT set", config.UseAuthHeaderEnv)
 		}
-		useAuthHeader = strings.ToLower(useAuthHeader)
-		config.UseAuthHeader = useAuthHeader == "true" || useAuthHeader == "1"
+		if useAuthHeader == "" {
+			return fmt.Errorf("UseAuthHeaderEnv %q is empty", config.UseAuthHeaderEnv)
+		}
+		useAuthHeaderBool, err := strconv.ParseBool(useAuthHeader)
+		if err != nil {
+			return fmt.Errorf("UseAuthHeaderEnv %q: %w", config.UseAuthHeaderEnv, err)
+		}
+		config.UseAuthHeader = useAuthHeaderBool
 	}
 	if config.IgnorePathPrefixesEnv != "" {
 		ignorePathPrefixes := os.Getenv(config.IgnorePathPrefixesEnv)
@@ -344,7 +374,10 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 	}
 	refreshBeforeExpiry, err := time.ParseDuration(config.RefreshBeforeExpiry)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("invalid RefreshBeforeExpiry %q: %w", config.RefreshBeforeExpiry, err)
+	}
+	if refreshBeforeExpiry < 0 {
+		return nil, errors.New("RefreshBeforeExpiry must not be negative")
 	}
 
 	userClaimName := "preferred_username"
@@ -355,6 +388,9 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 	userHeaderName := "X-Forwarded-User"
 	if config.UserHeaderName != "" {
 		userHeaderName = config.UserHeaderName
+	}
+	if !validUserHeaderName(userHeaderName) {
+		return nil, fmt.Errorf("invalid user header name %q", userHeaderName)
 	}
 
 	ignorePathPrefixes, err := parseIgnorePathPrefixes(config.IgnorePathPrefixes)

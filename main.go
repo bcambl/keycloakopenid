@@ -50,6 +50,13 @@ func isNavigationRequest(req *http.Request) bool {
 // begins with the prefix followed by a slash.
 func (k *keycloakAuth) isIgnoredPath(path string) bool {
 	for _, prefix := range k.IgnorePathPrefixes {
+		if prefix == "/" {
+			return true
+		}
+		prefix = strings.TrimRight(prefix, "/")
+		if prefix == "" {
+			continue
+		}
 		if path == prefix || strings.HasPrefix(path, prefix+"/") {
 			return true
 		}

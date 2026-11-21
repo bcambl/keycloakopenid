@@ -196,6 +196,31 @@ func TestIgnoredPathSegmentMatching(t *testing.T) {
 	}
 }
 
+func TestRootAndTrailingSlashIgnorePathMatching(t *testing.T) {
+	trailing := &keycloakAuth{IgnorePathPrefixes: []string{"/api/"}}
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"/api", true},
+		{"/api/", true},
+		{"/api/users", true},
+		{"/apix", false},
+	}
+	for _, tc := range cases {
+		if got := trailing.isIgnoredPath(tc.path); got != tc.want {
+			t.Fatalf("isIgnoredPath(%q) with prefix /api/ = %t, want %t", tc.path, got, tc.want)
+		}
+	}
+
+	root := &keycloakAuth{IgnorePathPrefixes: []string{"/"}}
+	for _, path := range []string{"/", "/healthz", "/admin"} {
+		if !root.isIgnoredPath(path) {
+			t.Fatalf("isIgnoredPath(%q) with prefix / = false, want true", path)
+		}
+	}
+}
+
 func TestIsNavigationRequestTable(t *testing.T) {
 	cases := []struct {
 		name      string
