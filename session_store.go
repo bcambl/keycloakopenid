@@ -1,16 +1,22 @@
 package keycloakopenid
 
 import (
+	"container/list"
 	"sync"
 	"time"
 )
 
+// Session holds the tokens and validated identity of one authenticated browser
+// session. Its mutex serializes token rotation so a refresh cannot interleave
+// with another reader or writer of the same session.
 type Session struct {
 	mu               sync.Mutex
 	AccessToken      string
 	RefreshToken     string
 	ExpiresAt        time.Time
 	RefreshExpiresAt time.Time
+	Subject          string
+	Claims           map[string]any
 }
 
 func (s *Session) snapshot() (accessToken, refreshToken string, expiresAt time.Time) {
@@ -23,11 +29,52 @@ func (s *Session) snapshot() (accessToken, refreshToken string, expiresAt time.T
 func (s *Session) expired(now time.Time) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	accessExpired := !s.ExpiresAt.IsZero() && now.After(s.ExpiresAt)
+	return s.expiredLocked(now)
+}
+
+// expiredLocked reports whether the session can neither authorize nor be
+// renewed. The caller must hold the session lock. A session expires exactly at
+// its expiry timestamp, matching the OIDC exp claim, which is valid only while
+// now is strictly before exp.
+func (s *Session) expiredLocked(now time.Time) bool {
+	accessExpired := !s.ExpiresAt.IsZero() && !now.Before(s.ExpiresAt)
 	if s.RefreshToken == "" {
 		return accessExpired
 	}
-	return accessExpired && !s.RefreshExpiresAt.IsZero() && now.After(s.RefreshExpiresAt)
+	return accessExpired && !s.RefreshExpiresAt.IsZero() && !now.Before(s.RefreshExpiresAt)
+}
+
+// applyTokenSet atomically replaces the session's tokens and expiry from a
+// token set produced by an exchange or refresh. RefreshExpiresIn semantics:
+// nil preserves the previous refresh expiry, 0 clears it (no fixed expiry), and
+// a positive value replaces it. A negative value is invalid and is rejected
+// before a token set is built, so it is never observed here. A non-empty
+// identity subject replaces the stored identity; an empty subject preserves it.
+func (s *Session) applyTokenSet(ts *tokenSet) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.AccessToken = ts.AccessToken
+	if ts.RefreshToken != "" {
+		s.RefreshToken = ts.RefreshToken
+	}
+	s.ExpiresAt = time.Now().Add(time.Duration(ts.ExpiresIn) * time.Second)
+
+	switch {
+	case ts.RefreshExpiresIn == nil:
+		// preserve the previous refresh expiry
+	case *ts.RefreshExpiresIn == 0:
+		s.RefreshExpiresAt = time.Time{}
+	case *ts.RefreshExpiresIn > 0:
+		s.RefreshExpiresAt = time.Now().Add(time.Duration(*ts.RefreshExpiresIn) * time.Second)
+	default:
+		// negative is invalid; preserve to avoid corrupting state
+	}
+
+	if ts.Identity.Subject != "" {
+		s.Subject = ts.Identity.Subject
+		s.Claims = ts.Identity.Claims
+	}
 }
 
 var (
@@ -35,82 +82,172 @@ var (
 	sharedStores   = map[string]*SessionStore{}
 )
 
-// sharedSessionStore returns the process-wide store for one Keycloak client.
-// Traefik creates a middleware instance per router and recreates every
-// instance on each configuration reload, so sessions must outlive instances.
-func sharedSessionStore(key string) *SessionStore {
+// sessionCleanupInterval is how often each process-global store sweeps expired
+// sessions in the background.
+const sessionCleanupInterval = time.Minute
+
+// sharedSessionStore returns the process-wide store for one Keycloak client,
+// creating it with the given capacity on first use. Traefik creates a
+// middleware instance per router and recreates every instance on each
+// configuration reload, so sessions must outlive instances. A single cleanup
+// goroutine is started per store.
+func sharedSessionStore(key string, capacity int) *SessionStore {
 	sharedStoresMu.Lock()
 	defer sharedStoresMu.Unlock()
 	store, ok := sharedStores[key]
 	if !ok {
-		store = NewSessionStore()
+		store = NewSessionStore(capacity)
 		sharedStores[key] = store
 	}
+	store.startCleanup()
 	return store
 }
 
+// sessionEntry links a stored session to its position in the LRU order.
+type sessionEntry struct {
+	id      string
+	session *Session
+	element *list.Element
+}
+
+// SessionStore is a capacity-bounded LRU cache of sessions keyed by session ID.
+// The store lock guards the map and LRU order and is never held while waiting
+// on a session lock, so a slow renewal cannot block unrelated request paths.
 type SessionStore struct {
-	sessions map[string]*Session
-	mu       sync.RWMutex
+	mu        sync.Mutex
+	capacity  int
+	order     *list.List
+	byID      map[string]*list.Element
+	startOnce sync.Once
 }
 
-func NewSessionStore() *SessionStore {
+// NewSessionStore returns an empty store with the given capacity. A cleanup
+// goroutine is started separately by sharedSessionStore, never here, so tests
+// can exercise the store without leaving background goroutines behind.
+func NewSessionStore(capacity int) *SessionStore {
 	return &SessionStore{
-		sessions: make(map[string]*Session),
+		capacity: capacity,
+		order:    list.New(),
+		byID:     make(map[string]*list.Element),
 	}
 }
 
-func (s *SessionStore) Set(sessionID string, session *Session) {
-	s.evictExpired(time.Now())
+func (s *SessionStore) startCleanup() {
+	s.startOnce.Do(func() {
+		go s.cleanupLoop(sessionCleanupInterval)
+	})
+}
+
+func (s *SessionStore) cleanupLoop(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.Cleanup(time.Now())
+	}
+}
+
+// SetCapacity adjusts the store's capacity and immediately evicts the least
+// recently used sessions until the store is within the new bound.
+func (s *SessionStore) SetCapacity(capacity int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.sessions[sessionID] = session
+	s.capacity = capacity
+	s.trim()
 }
 
-// evictExpired drops sessions that will never be requested again. Session
-// locks are taken outside the store lock because a renewal holds its session
-// lock while calling Keycloak.
-func (s *SessionStore) evictExpired(now time.Time) {
-	s.mu.RLock()
-	candidates := make(map[string]*Session, len(s.sessions))
-	for id, session := range s.sessions {
-		candidates[id] = session
-	}
-	s.mu.RUnlock()
-
-	for id, session := range candidates {
-		if !session.expired(now) {
-			delete(candidates, id)
-		}
-	}
-
+// Set inserts or replaces the session for id and marks it most recently used.
+// It is O(1): an insertion or update plus LRU eviction only. It never scans for
+// expired sessions.
+func (s *SessionStore) Set(id string, session *Session) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for id, session := range candidates {
-		if s.sessions[id] == session {
-			delete(s.sessions, id)
+	if elem, ok := s.byID[id]; ok {
+		elem.Value.(*sessionEntry).session = session
+		s.order.MoveToFront(elem)
+		return
+	}
+	entry := &sessionEntry{id: id, session: session}
+	entry.element = s.order.PushFront(entry)
+	s.byID[id] = entry.element
+	s.trim()
+}
+
+// trim evicts the least recently used sessions until the store is within its
+// capacity. The caller must hold the store lock.
+func (s *SessionStore) trim() {
+	for s.order.Len() > s.capacity {
+		back := s.order.Back()
+		if back == nil {
+			return
 		}
+		entry := back.Value.(*sessionEntry)
+		s.order.Remove(back)
+		delete(s.byID, entry.id)
 	}
 }
 
-func (s *SessionStore) Get(sessionID string) (*Session, bool) {
-	s.mu.RLock()
-	session, exists := s.sessions[sessionID]
-	s.mu.RUnlock()
-	if !exists {
+// Get returns the session for id if it exists and has not expired, marking it
+// most recently used. An expired session is deleted on access.
+func (s *SessionStore) Get(id string) (*Session, bool) {
+	s.mu.Lock()
+	elem, ok := s.byID[id]
+	if !ok {
+		s.mu.Unlock()
 		return nil, false
 	}
-	if session.expired(time.Now()) {
-		s.mu.Lock()
-		delete(s.sessions, sessionID)
-		s.mu.Unlock()
+	session := elem.Value.(*sessionEntry).session
+	s.order.MoveToFront(elem)
+	s.mu.Unlock()
+
+	if s.removeExpired(id, session, time.Now()) {
 		return nil, false
 	}
 	return session, true
 }
 
-func (s *SessionStore) Delete(sessionID string) {
+// Delete removes the session for id if present.
+func (s *SessionStore) Delete(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.sessions, sessionID)
+	if elem, ok := s.byID[id]; ok {
+		s.order.Remove(elem)
+		delete(s.byID, id)
+	}
+}
+
+// Cleanup deletes every session that has expired as of now. It never holds the
+// store lock while waiting on a session lock, so a session blocked in renewal
+// does not stall the sweep or any request path.
+func (s *SessionStore) Cleanup(now time.Time) {
+	s.mu.Lock()
+	candidates := make([]*sessionEntry, 0, len(s.byID))
+	for elem := s.order.Front(); elem != nil; elem = elem.Next() {
+		candidates = append(candidates, elem.Value.(*sessionEntry))
+	}
+	s.mu.Unlock()
+
+	for _, entry := range candidates {
+		s.removeExpired(entry.id, entry.session, now)
+	}
+}
+
+// removeExpired deletes id if the store still maps it to session and the
+// session has expired as of now. It holds the session lock while rechecking
+// expiry and, before deleting, verifies the store entry still points at the
+// same session, so a concurrent renewal or replacement is never deleted. It
+// reports whether the entry was removed.
+func (s *SessionStore) removeExpired(id string, session *Session, now time.Time) bool {
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if !session.expiredLocked(now) {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if elem, ok := s.byID[id]; ok && elem.Value.(*sessionEntry).session == session {
+		s.order.Remove(elem)
+		delete(s.byID, id)
+		return true
+	}
+	return false
 }

@@ -117,6 +117,12 @@ func newTestMiddleware(t *testing.T, kc *testKeycloak, config Config) *keycloakA
 	return auth
 }
 
+func resetSharedStores() {
+	sharedStoresMu.Lock()
+	defer sharedStoresMu.Unlock()
+	sharedStores = map[string]*SessionStore{}
+}
+
 func (kc *testKeycloak) refreshCalls() int {
 	kc.mu.Lock()
 	defer kc.mu.Unlock()
@@ -307,6 +313,52 @@ func TestRenewSessionRejectsMissingAccessToken(t *testing.T) {
 	}
 	if s.AccessToken != "old" || s.RefreshToken != "rt1" {
 		t.Fatalf("session mutated on malformed refresh response: %+v", s)
+	}
+}
+
+func TestSharedStoreOneRefreshAcrossInstances(t *testing.T) {
+	resetSharedStores()
+	kc := newTestKeycloak(t)
+	kc.tokenBody = tokenJSON("new", "rt2", 300)
+	first := newTestMiddleware(t, kc, Config{})
+	second := newTestMiddleware(t, kc, Config{})
+
+	if first.SessionStore != second.SessionStore {
+		t.Fatal("instances of the same client must share one store")
+	}
+
+	s := &Session{AccessToken: "old", RefreshToken: "rt1", ExpiresAt: time.Now().Add(-time.Second)}
+	first.SessionStore.Set("shared", s)
+
+	got, ok := second.SessionStore.Get("shared")
+	if !ok || got != s {
+		t.Fatal("the shared store must return the same session across instances")
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			if idx == 0 {
+				errs[idx] = first.renewSession(s)
+			} else {
+				errs[idx] = second.renewSession(s)
+			}
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			t.Fatalf("renewSession returned error: %v", err)
+		}
+	}
+	if got := kc.refreshCalls(); got != 1 {
+		t.Fatalf("refresh calls = %d, want exactly 1 across instances", got)
+	}
+	if s.RefreshToken != "rt2" {
+		t.Fatalf("RefreshToken = %q, want rotated rt2", s.RefreshToken)
 	}
 }
 

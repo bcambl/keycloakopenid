@@ -353,7 +353,7 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 		IgnorePathPrefixes:  ignorePathPrefixes,
 		CallbackURL:         callbackURL,
 		SessionCapacity:     sessionCapacity,
-		SessionStore:        sharedSessionStore(strings.Join([]string{keycloakURL.String(), config.KeycloakRealm, config.ClientID}, "\x00")),
+		SessionStore:        sharedSessionStore(strings.Join([]string{keycloakURL.String(), config.KeycloakRealm, config.ClientID}, "\x00"), sessionCapacity),
 		RefreshBeforeExpiry: refreshBeforeExpiry,
 		upstream:            upstream,
 	}, nil
