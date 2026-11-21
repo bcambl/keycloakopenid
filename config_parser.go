@@ -81,6 +81,21 @@ func parseUrl(rawUrl string) (*url.URL, error) {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, fmt.Errorf("%v is not a valid scheme", u.Scheme)
 	}
+	if u.Host == "" {
+		return nil, errors.New("invalid url: missing host")
+	}
+	if u.User != nil {
+		return nil, errors.New("invalid url: userinfo not allowed")
+	}
+	if strings.Contains(rawUrl, "#") {
+		return nil, errors.New("invalid url: fragment not allowed")
+	}
+	if u.RawQuery != "" {
+		return nil, errors.New("invalid url: query not allowed")
+	}
+	if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
+		return nil, errors.New("url must use https except on loopback")
+	}
 	return u, nil
 }
 

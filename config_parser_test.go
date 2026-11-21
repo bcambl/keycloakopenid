@@ -161,7 +161,7 @@ func TestConfigIgnorePathPrefixesRejectMalformed(t *testing.T) {
 }
 
 func TestParseURLSchemes(t *testing.T) {
-	valid := []string{"http://kc.test", "https://kc.test", "http://127.0.0.1:8080"}
+	valid := []string{"https://kc.test", "http://127.0.0.1:8080", "http://localhost:8080", "http://app.localhost:8080"}
 	for _, raw := range valid {
 		t.Run("valid "+raw, func(t *testing.T) {
 			if _, err := parseUrl(raw); err != nil {
@@ -169,7 +169,16 @@ func TestParseURLSchemes(t *testing.T) {
 			}
 		})
 	}
-	invalid := []string{"ftp://kc.test", "httpsfoo://kc.test", "file:///etc/passwd"}
+	invalid := []string{
+		"ftp://kc.test",
+		"httpsfoo://kc.test",
+		"file:///etc/passwd",
+		"http://kc.test",
+		"https://user@kc.test",
+		"https://kc.test/realm?x=1",
+		"https://kc.test/realm#fragment",
+		"https:///missing-host",
+	}
 	for _, raw := range invalid {
 		t.Run("invalid "+raw, func(t *testing.T) {
 			if _, err := parseUrl(raw); err == nil {

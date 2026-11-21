@@ -237,7 +237,17 @@ func validProviderURL(raw string) bool {
 	if err != nil || !u.IsAbs() || u.Host == "" {
 		return false
 	}
-	return strings.EqualFold(u.Scheme, "http") || strings.EqualFold(u.Scheme, "https")
+	if u.User != nil || strings.Contains(raw, "#") {
+		return false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return false
+	}
+	if scheme == "http" && !isLoopbackHost(u.Hostname()) {
+		return false
+	}
+	return true
 }
 
 func discoveryErrorKind(status int) oidcErrKind {

@@ -51,7 +51,7 @@ Or from environment variables:
 
 | Option | Default | Description |
 |---|---|---|
-| `KeycloakURL` | - | Keycloak base URL. A complete URL or a bare host is accepted. Required. |
+| `KeycloakURL` | - | Keycloak base URL. A complete URL or a bare host is accepted. Must use HTTPS except on loopback hosts and must not include userinfo, a query, or a fragment. Required. |
 | `ClientID` | - | OIDC client ID. Required. |
 | `ClientSecret` | - | OIDC client secret. Required for the confidential-client code exchange, refresh, and introspection. |
 | `KeycloakRealm` | - | Keycloak realm. Required. |
@@ -62,15 +62,17 @@ Or from environment variables:
 | `UserClaimName` | `preferred_username` | ID-token claim forwarded as the user identity. |
 | `UserHeaderName` | `X-Forwarded-User` | Header the user identity is written to. Must be a valid RFC 7230 header field name and must not be `Authorization`. |
 | `IgnorePathPrefixes` | none | Comma-delimited path prefixes that bypass authentication. Matched by path segment, not substring. Trailing slashes are removed, so `/api/` behaves as `/api`. |
-| `LegacySupport` | `false` | Probe for an older Keycloak instance that serves realms under `/auth`. |
+| `LegacySupport` | `false` | Target an older Keycloak instance that serves realms under `/auth`. |
 | `RefreshBeforeExpiry` | `30s` | How close to access-token expiry a session is renewed. Must not be negative. |
-| `InsecureSkipVerify` | `false` | Skip TLS verification of the Keycloak connection. For development only. |
+| `InsecureSkipVerify` | `false` | Skip TLS certificate verification of an HTTPS Keycloak connection. Development only; it does not permit plain HTTP. |
 
 `KeycloakURL`, `InsecureSkipVerify`, `ClientID`, `ClientSecret`, `KeycloakRealm`, `Scope`, `UseAuthHeader`, `IgnorePathPrefixes`, `LegacySupport`, and `RefreshBeforeExpiry` each also accept an `...Env` variant. `CallbackURL` and `SessionCapacity` are set directly only.
 
 Every referenced environment variable must be set and non-empty. Boolean variables parse with Go's boolean syntax (`true`, `false`, `1`, `0`, and their variants); a missing, empty, or malformed value is a configuration error. Environment values take precedence over directly configured values, so a valid `UseAuthHeaderEnv: "false"` overrides `UseAuthHeader: true`.
 
 Warning: an ignore prefix of `/` matches every valid absolute path and therefore disables authentication for every request routed through that middleware. Use it only on a router that must remain fully public.
+
+Transport security is separate from certificate verification. A configured `KeycloakURL`, and every endpoint returned by OIDC discovery, must use HTTPS unless the host is a loopback address (`localhost`, `*.localhost`, or a loopback IP). Discovered endpoint URLs may carry a query string but must not carry userinfo or a fragment. `InsecureSkipVerify` only disables TLS certificate checks on an HTTPS connection; it never upgrades or permits a plain-HTTP provider.
 
 ### CallbackURL registration
 

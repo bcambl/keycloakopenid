@@ -480,11 +480,23 @@ func TestNewOIDCClientRejectsInvalidProviderURLs(t *testing.T) {
 	}{
 		{"relative authorization endpoint", "authorization_endpoint", "/authorize"},
 		{"non-HTTP authorization endpoint", "authorization_endpoint", "file:///authorize"},
+		{"http authorization endpoint", "authorization_endpoint", "http://provider.test/authorize"},
+		{"authorization endpoint with userinfo", "authorization_endpoint", "https://user@provider.test/authorize"},
+		{"authorization endpoint with fragment", "authorization_endpoint", "https://provider.test/authorize#fragment"},
 		{"relative token endpoint", "token_endpoint", "/token"},
 		{"non-HTTP token endpoint", "token_endpoint", "ftp://provider.test/token"},
+		{"http token endpoint", "token_endpoint", "http://provider.test/token"},
+		{"token endpoint with userinfo", "token_endpoint", "https://user@provider.test/token"},
+		{"token endpoint with fragment", "token_endpoint", "https://provider.test/token#fragment"},
 		{"relative JWKS endpoint", "jwks_uri", "/jwks"},
 		{"non-HTTP JWKS endpoint", "jwks_uri", "javascript:alert(1)"},
 		{"endpoint without host", "jwks_uri", "https:///jwks"},
+		{"http JWKS endpoint", "jwks_uri", "http://provider.test/jwks"},
+		{"JWKS endpoint with userinfo", "jwks_uri", "https://user@provider.test/jwks"},
+		{"JWKS endpoint with fragment", "jwks_uri", "https://provider.test/jwks#fragment"},
+		{"http introspection endpoint", "introspection_endpoint", "http://provider.test/introspect"},
+		{"introspection endpoint with userinfo", "introspection_endpoint", "https://user@provider.test/introspect"},
+		{"introspection endpoint with fragment", "introspection_endpoint", "https://provider.test/introspect#fragment"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -493,6 +505,7 @@ func TestNewOIDCClientRejectsInvalidProviderURLs(t *testing.T) {
 				"issuer":                 p.issuer,
 				"authorization_endpoint": p.issuer + "/protocol/openid-connect/auth",
 				"token_endpoint":         p.issuer + "/protocol/openid-connect/token",
+				"introspection_endpoint": p.issuer + "/protocol/openid-connect/token/introspect",
 				"jwks_uri":               p.srv.URL + "/jwks",
 			}
 			doc[tc.field] = tc.value
@@ -507,6 +520,54 @@ func TestNewOIDCClientRejectsInvalidProviderURLs(t *testing.T) {
 				Upstream:     newUpstreamHTTPClient(false),
 			})
 			wantOIDCError(t, err, oidcErrMalformed)
+		})
+	}
+}
+
+func TestNewOIDCClientAcceptsProviderEndpointQueries(t *testing.T) {
+	p := newOIDCTestProvider(t)
+	introspectionURL := p.issuer + "/protocol/openid-connect/token/introspect?tenant=a"
+	p.discoveryBody = mustJSON(map[string]any{
+		"issuer":                 p.issuer,
+		"authorization_endpoint": p.issuer + "/protocol/openid-connect/auth?tenant=a",
+		"token_endpoint":         p.issuer + "/protocol/openid-connect/token?tenant=a",
+		"introspection_endpoint": introspectionURL,
+		"jwks_uri":               p.srv.URL + "/jwks?tenant=a",
+	})
+	c := p.newClient(t)
+	if c.introspectionURL != introspectionURL {
+		t.Fatalf("introspectionURL = %q, want %q", c.introspectionURL, introspectionURL)
+	}
+}
+
+func TestValidProviderURL(t *testing.T) {
+	valid := []string{
+		"https://provider.test/endpoint",
+		"https://provider.test/token?tenant=a",
+		"http://127.0.0.1:8080/endpoint",
+		"http://localhost/endpoint",
+		"http://app.localhost/endpoint",
+	}
+	for _, raw := range valid {
+		t.Run("valid "+raw, func(t *testing.T) {
+			if !validProviderURL(raw) {
+				t.Fatalf("validProviderURL(%q) = false, want true", raw)
+			}
+		})
+	}
+	invalid := []string{
+		"/endpoint",
+		"https:///endpoint",
+		"http://provider.test/endpoint",
+		"https://user@provider.test/endpoint",
+		"https://provider.test/endpoint#fragment",
+		"file:///endpoint",
+	}
+	for _, raw := range invalid {
+		t.Run("invalid "+raw, func(t *testing.T) {
+			if validProviderURL(raw) {
+				t.Fatalf("validProviderURL(%q) = true, want false", raw)
+			}
 		})
 	}
 }
