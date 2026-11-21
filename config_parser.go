@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -83,6 +84,39 @@ func parseUrl(rawUrl string) (*url.URL, error) {
 	return u, nil
 }
 
+func canonicalKeycloakURL(u *url.URL) string {
+	canonical := *u
+	canonical.Scheme = strings.ToLower(canonical.Scheme)
+	hostname := strings.ToLower(canonical.Hostname())
+	port := canonical.Port()
+	if canonical.Scheme == "http" && port == "80" || canonical.Scheme == "https" && port == "443" {
+		port = ""
+	}
+	canonical.Host = hostname
+	if strings.Contains(hostname, ":") {
+		canonical.Host = "[" + hostname + "]"
+	}
+	if port != "" {
+		canonical.Host = net.JoinHostPort(hostname, port)
+	}
+
+	escapedPath := canonical.EscapedPath()
+	canonical.Path = ""
+	canonical.RawPath = ""
+	if escapedPath != "" && escapedPath != "/" {
+		normalizedPath := path.Clean(escapedPath)
+		decodedPath, err := url.PathUnescape(normalizedPath)
+		if err != nil {
+			return ""
+		}
+		canonical.Path = decodedPath
+		if normalizedPath != decodedPath {
+			canonical.RawPath = normalizedPath
+		}
+	}
+	return canonical.String()
+}
+
 // validateCallbackURL accepts only exact http/https schemes and, for http,
 // only loopback hosts, so development can use a plain HTTP callback while any
 // deployed callback must be HTTPS.
@@ -102,6 +136,9 @@ func validateCallbackURL(raw string) (*url.URL, error) {
 	}
 	if u.Path == "" {
 		return nil, errors.New("invalid callback url: missing path")
+	}
+	if strings.Contains(raw, "#") {
+		return nil, errors.New("invalid callback url: fragment not allowed")
 	}
 	if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
 		return nil, errors.New("callback url must use https except on loopback")
@@ -270,7 +307,7 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 		return nil, err
 	}
 
-	if config.ClientID == "" || config.KeycloakRealm == "" {
+	if config.ClientID == "" || config.ClientSecret == "" || config.KeycloakRealm == "" {
 		return nil, errors.New("invalid configuration")
 	}
 
@@ -326,7 +363,7 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 	}
 
 	issuer := keycloakURL.JoinPath("realms", config.KeycloakRealm).String()
-	clientKey := strings.Join([]string{keycloakURL.String(), config.KeycloakRealm, config.ClientID}, "\x00")
+	clientKey := strings.Join([]string{canonicalKeycloakURL(keycloakURL), config.KeycloakRealm, config.ClientID}, "\x00")
 
 	oidcClient, err := newOIDCClient(uctx, runtimeConfig{
 		Issuer:       issuer,

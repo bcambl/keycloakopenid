@@ -3,6 +3,7 @@ package keycloakopenid
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -56,6 +57,15 @@ func newProviderAuth(t *testing.T, mutate func(*Config)) *keycloakAuth {
 func TestConfigRequiresCallbackURL(t *testing.T) {
 	config := testConfig()
 	config.CallbackURL = ""
+	newConfigError(t, config)
+}
+
+func TestConfigRequiresClientSecret(t *testing.T) {
+	p := newOIDCTestProvider(t)
+	config := testConfig()
+	config.KeycloakURL = p.srv.URL
+	config.ClientID = p.clientID
+	config.ClientSecret = ""
 	newConfigError(t, config)
 }
 
@@ -165,6 +175,32 @@ func TestParseURLSchemes(t *testing.T) {
 	}
 }
 
+func TestCanonicalKeycloakURL(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want string
+	}{
+		{"https://EXAMPLE.COM:443/auth/", "https://example.com/auth"},
+		{"http://EXAMPLE.COM:80/auth//", "http://example.com/auth"},
+		{"https://EXAMPLE.COM/", "https://example.com"},
+		{"https://EXAMPLE.COM:8443/auth/", "https://example.com:8443/auth"},
+		{"https://EXAMPLE.COM/auth/../base/", "https://example.com/base"},
+		{"https://EXAMPLE.COM/foo%2Fbar/", "https://example.com/foo%2Fbar"},
+		{"https://[2001:DB8::1]:443/auth/", "https://[2001:db8::1]/auth"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.raw, func(t *testing.T) {
+			u, err := url.Parse(tc.raw)
+			if err != nil {
+				t.Fatalf("url.Parse returned error: %v", err)
+			}
+			if got := canonicalKeycloakURL(u); got != tc.want {
+				t.Fatalf("canonicalKeycloakURL(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCallbackURLHTTPSRequired(t *testing.T) {
 	config := testConfig()
 	config.CallbackURL = "http://app.test/callback"
@@ -205,6 +241,9 @@ func TestValidateCallbackURL(t *testing.T) {
 		{"http non-loopback", "http://app.test/cb", true},
 		{"https empty path", "https://app.test", true},
 		{"https root path", "https://app.test/", false},
+		{"fragment", "https://app.test/cb#fragment", true},
+		{"empty fragment", "https://app.test/cb#", true},
+		{"encoded hash in path", "https://app.test/cb%23alias", false},
 		{"empty", "", true},
 		{"ftp", "ftp://app.test/cb", true},
 		{"no scheme", "app.test/cb", true},

@@ -1018,6 +1018,30 @@ func TestSameClientSharing(t *testing.T) {
 	}
 }
 
+func TestEquivalentKeycloakURLsShareClientState(t *testing.T) {
+	resetSharedStores()
+	resetSharedLoginStores()
+	p := newOIDCTestProvider(t)
+	first := newAuth(t, p, nil)
+	second := newAuth(t, p, func(c *Config) { c.KeycloakURL = p.srv.URL + "/" })
+
+	if first.SessionStore != second.SessionStore {
+		t.Fatal("equivalent Keycloak URLs must share one session store")
+	}
+	if first.loginStore != second.loginStore {
+		t.Fatal("equivalent Keycloak URLs must share one login store")
+	}
+	if first.clientKey != second.clientKey || sessionCookieName(first.clientKey) != sessionCookieName(second.clientKey) {
+		t.Fatal("equivalent Keycloak URLs must share one client key and cookie name")
+	}
+	if second.KeycloakURL.String() != p.srv.URL+"/" {
+		t.Fatalf("KeycloakURL = %q, want configured URL preserved", second.KeycloakURL)
+	}
+	if second.issuer != first.issuer {
+		t.Fatalf("issuer = %q, want %q", second.issuer, first.issuer)
+	}
+}
+
 // TestDifferentClientIsolation proves distinct clients never share sessions.
 func TestDifferentClientIsolation(t *testing.T) {
 	resetSharedStores()
