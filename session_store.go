@@ -240,19 +240,27 @@ func (s *SessionStore) Delete(id string) {
 	}
 }
 
+// sessionCandidate is an immutable snapshot of one stored session used by
+// Cleanup after it releases the store lock.
+type sessionCandidate struct {
+	id      string
+	session *Session
+}
+
 // Cleanup deletes every session that has expired as of now. It never holds the
 // store lock while waiting on a session lock, so a session blocked in renewal
 // does not stall the sweep or any request path.
 func (s *SessionStore) Cleanup(now time.Time) {
 	s.mu.Lock()
-	candidates := make([]*sessionEntry, 0, len(s.byID))
+	candidates := make([]sessionCandidate, 0, len(s.byID))
 	for elem := s.order.Front(); elem != nil; elem = elem.Next() {
-		candidates = append(candidates, elem.Value.(*sessionEntry))
+		entry := elem.Value.(*sessionEntry)
+		candidates = append(candidates, sessionCandidate{id: entry.id, session: entry.session})
 	}
 	s.mu.Unlock()
 
-	for _, entry := range candidates {
-		s.removeExpired(entry.id, entry.session, now)
+	for _, candidate := range candidates {
+		s.removeExpired(candidate.id, candidate.session, now)
 	}
 }
 

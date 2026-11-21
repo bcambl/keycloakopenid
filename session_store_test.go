@@ -1,6 +1,7 @@
 package keycloakopenid
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -268,6 +269,40 @@ func TestSessionStoreCleanupRechecksExpiryUnderLock(t *testing.T) {
 
 	if _, ok := store.Get("id"); !ok {
 		t.Fatal("session renewed while cleanup was blocked must survive")
+	}
+}
+
+func TestSessionStoreCleanupConcurrentReplacement(t *testing.T) {
+	store := NewSessionStore(10)
+	const iterations = 1000
+	for i := 0; i < iterations; i++ {
+		old := &Session{AccessToken: "old", ExpiresAt: time.Now().Add(-time.Minute)}
+		replacement := &Session{AccessToken: "new", ExpiresAt: time.Now().Add(time.Hour)}
+		store.Set("id", old)
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			store.Cleanup(time.Now())
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			store.Set("id", replacement)
+		}()
+		close(start)
+		wg.Wait()
+
+		got, ok := store.Get("id")
+		if !ok {
+			t.Fatalf("iteration %d: replacement session was deleted", i)
+		}
+		if got != replacement {
+			t.Fatalf("iteration %d: retained session = %p, want replacement %p", i, got, replacement)
+		}
 	}
 }
 
