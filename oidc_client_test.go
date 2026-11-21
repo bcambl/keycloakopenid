@@ -652,6 +652,19 @@ func TestExchangeSupportsAsymmetricAlgorithms(t *testing.T) {
 	}
 }
 
+func TestECDSAPublicKeyRejectsOffCurvePoint(t *testing.T) {
+	coordinate := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	key := jwkJSON{KeyType: "EC", Curve: "P-256", X: coordinate, Y: coordinate}
+
+	_, err := key.ecdsaPublicKey()
+	if err == nil {
+		t.Fatal("ecdsaPublicKey accepted an off-curve point")
+	}
+	if got, want := err.Error(), "oidc: invalid ECDSA jwks key"; got != want {
+		t.Fatalf("error = %q, want %q", got, want)
+	}
+}
+
 func TestExchangeSendsS256VerifierAndExactRedirect(t *testing.T) {
 	p := newOIDCTestProvider(t)
 	c := p.newClient(t)

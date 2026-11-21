@@ -215,15 +215,16 @@ func (k jwkJSON) ecdsaPublicKey() (*ecdsa.PublicKey, error) {
 	if len(x) != size || len(y) != size {
 		return nil, errors.New("oidc: invalid ECDSA jwks key")
 	}
-	encoded := make([]byte, 1+2*size)
-	encoded[0] = 4
-	copy(encoded[1:size+1], x)
-	copy(encoded[size+1:], y)
-	publicKey, err := ecdsa.ParseUncompressedPublicKey(curve, encoded)
-	if err != nil {
+	xInt := new(big.Int).SetBytes(x)
+	yInt := new(big.Int).SetBytes(y)
+	prime := curve.Params().P
+	if xInt.Sign() < 0 || yInt.Sign() < 0 || xInt.Cmp(prime) >= 0 || yInt.Cmp(prime) >= 0 {
 		return nil, errors.New("oidc: invalid ECDSA jwks key")
 	}
-	return publicKey, nil
+	if !curve.IsOnCurve(xInt, yInt) { //nolint:staticcheck // Traefik Yaegi compatibility.
+		return nil, errors.New("oidc: invalid ECDSA jwks key")
+	}
+	return &ecdsa.PublicKey{Curve: curve, X: xInt, Y: yInt}, nil //nolint:staticcheck // Traefik Yaegi compatibility.
 }
 
 func (k jwkJSON) ed25519PublicKey() (ed25519.PublicKey, error) {
