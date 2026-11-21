@@ -220,6 +220,8 @@ func TestSafeReturnTarget(t *testing.T) {
 		{"empty path", &url.URL{}, "/", true},
 		{"absolute", &url.URL{Scheme: "https", Host: "evil.test", Path: "/x"}, "", false},
 		{"protocol relative", &url.URL{Host: "evil.test", Path: "/x"}, "", false},
+		{"protocol relative path", &url.URL{Path: "//evil.test/x"}, "", false},
+		{"double slash query", &url.URL{Path: "/x", RawQuery: "next=//evil.test"}, "/x?next=//evil.test", true},
 		{"backslash", &url.URL{Path: "/foo\\bar"}, "", false},
 		{"control char", &url.URL{Path: "/foo\x00bar"}, "", false},
 		{"newline in query", &url.URL{Path: "/x", RawQuery: "a=\n"}, "", false},
@@ -342,6 +344,27 @@ func resetSharedLoginStores() {
 	sharedLoginStoresMu.Lock()
 	defer sharedLoginStoresMu.Unlock()
 	sharedLoginStores = map[string]*loginStore{}
+}
+
+func TestBeginRejectsUnsafeReturnTarget(t *testing.T) {
+	store := newTestLoginStore(t)
+	cases := []struct {
+		name   string
+		target string
+	}{
+		{"empty", ""},
+		{"absolute", "https://evil.test/x"},
+		{"protocol relative", "//evil.test/x"},
+		{"backslash", "/foo\\bar"},
+		{"control char", "/foo\x00bar"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, _, err := store.Begin(tc.target); err == nil {
+				t.Fatalf("Begin(%q) returned no error, want rejection", tc.target)
+			}
+		})
+	}
 }
 
 func TestSharedLoginStore(t *testing.T) {

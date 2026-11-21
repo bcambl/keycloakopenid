@@ -79,8 +79,13 @@ func (l *loginStore) cleanupLoop(interval time.Duration) {
 }
 
 // Begin creates a new pending login transaction for the given validated
-// relative return target and returns its state, nonce, and PKCE verifier.
+// relative return target and returns its state, nonce, and PKCE verifier. The
+// target is re-validated here as defense in depth so a caller cannot bypass
+// safeReturnTarget and store an unsafe redirect.
 func (l *loginStore) Begin(returnTarget string) (state, nonce, verifier string, err error) {
+	if !isSafeReturnTarget(returnTarget) {
+		return "", "", "", errors.New("return target must be a relative path")
+	}
 	state, err = randomLoginValue()
 	if err != nil {
 		return "", "", "", err
@@ -266,13 +271,30 @@ func safeReturnTarget(requestURL *url.URL) (string, error) {
 	path := requestURL.Path
 	if path == "" {
 		path = "/"
+	} else if strings.HasPrefix(path, "//") {
+		return "", errors.New("return target must not be protocol-relative")
 	} else if !strings.HasPrefix(path, "/") {
 		return "", errors.New("return target must be an absolute path")
 	}
+	target := path
 	if requestURL.RawQuery != "" {
-		return path + "?" + requestURL.RawQuery, nil
+		target += "?" + requestURL.RawQuery
 	}
-	return path, nil
+	if !isSafeReturnTarget(target) {
+		return "", errors.New("return target is unsafe")
+	}
+	return target, nil
+}
+
+// isSafeReturnTarget reports whether s is a safe same-origin return target: a
+// non-empty path beginning with exactly one slash (never "//") and containing
+// no backslash or control characters. It is the final check applied to both the
+// normalized target from safeReturnTarget and the string stored by Begin.
+func isSafeReturnTarget(s string) bool {
+	if !strings.HasPrefix(s, "/") || strings.HasPrefix(s, "//") {
+		return false
+	}
+	return !unsafeReturnTarget(s)
 }
 
 // unsafeReturnTarget reports whether s contains a backslash or a control
