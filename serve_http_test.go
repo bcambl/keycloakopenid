@@ -902,14 +902,16 @@ func TestRefreshIDTokenBinding(t *testing.T) {
 		name           string
 		setNonce       bool
 		mismatchNonce  bool
+		emptyNonce     bool
 		changeAudience bool
 		wantStatus     int
 		wantSession    bool
 	}{
-		{"matching nonce", true, false, false, http.StatusOK, true},
-		{"mismatching nonce", true, true, false, http.StatusUnauthorized, false},
-		{"omitted nonce", false, false, false, http.StatusOK, true},
-		{"changed audience", false, false, true, http.StatusUnauthorized, false},
+		{name: "matching nonce", setNonce: true, wantStatus: http.StatusOK, wantSession: true},
+		{name: "mismatching nonce", setNonce: true, mismatchNonce: true, wantStatus: http.StatusUnauthorized},
+		{name: "empty nonce", setNonce: true, emptyNonce: true, wantStatus: http.StatusUnauthorized},
+		{name: "omitted nonce", wantStatus: http.StatusOK, wantSession: true},
+		{name: "changed audience", changeAudience: true, wantStatus: http.StatusUnauthorized},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -933,6 +935,9 @@ func TestRefreshIDTokenBinding(t *testing.T) {
 				claims["nonce"] = initialNonce
 				if tc.mismatchNonce {
 					claims["nonce"] = "different-nonce"
+				}
+				if tc.emptyNonce {
+					claims["nonce"] = ""
 				}
 			}
 			if tc.changeAudience {

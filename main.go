@@ -309,7 +309,7 @@ func (k *keycloakAuth) renewSession(ctx context.Context, session *Session, obser
 		if ts.Identity.Subject != session.Subject {
 			return newOIDCError(oidcErrRefusal, errors.New("oidc: refresh changed the session subject"))
 		}
-		if ts.Identity.Nonce != "" && subtle.ConstantTimeCompare([]byte(ts.Identity.Nonce), []byte(session.Nonce)) != 1 {
+		if _, present := ts.Identity.Claims["nonce"]; present && subtle.ConstantTimeCompare([]byte(ts.Identity.Nonce), []byte(session.Nonce)) != 1 {
 			return newOIDCError(oidcErrRefusal, errors.New("oidc: refresh changed the session nonce"))
 		}
 		if !sameAudienceSet(session.Audience, ts.Identity.Audience) {
