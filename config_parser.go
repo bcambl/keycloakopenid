@@ -2,9 +2,9 @@ package keycloakopenid
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -25,8 +25,9 @@ type Config struct {
 	UserHeaderName      string `json:"user_header_name"`
 	IgnorePathPrefixes  string `json:"ignore_path_prefixes"`
 	LegacySupport       bool   `json:"legacy_support"`
-	SilentRenewal       *bool  `json:"silent_renewal"`
 	RefreshBeforeExpiry string `json:"refresh_before_expiry"`
+	CallbackURL         string `json:"callback_url"`
+	SessionCapacity     int    `json:"session_capacity"`
 
 	ClientIDFile           string `json:"client_id_file"`
 	ClientSecretFile       string `json:"client_secret_file"`
@@ -39,7 +40,6 @@ type Config struct {
 	UseAuthHeaderEnv       string `json:"use_auth_header_env"`
 	IgnorePathPrefixesEnv  string `json:"ignore_path_prefixes_env"`
 	LegacySupportEnv       string `json:"legacy_support_env"`
-	SilentRenewalEnv       string `json:"silent_renewal_env"`
 	RefreshBeforeExpiryEnv string `json:"refresh_before_expiry_env"`
 }
 
@@ -55,9 +55,11 @@ type keycloakAuth struct {
 	UserClaimName       string
 	UserHeaderName      string
 	IgnorePathPrefixes  []string
+	CallbackURL         *url.URL
+	SessionCapacity     int
 	SessionStore        *SessionStore
-	SilentRenewal       bool
 	RefreshBeforeExpiry time.Duration
+	upstream            *http.Client
 }
 
 type KeycloakTokenResponse struct {
@@ -73,7 +75,7 @@ type state struct {
 }
 
 func CreateConfig() *Config {
-	return &Config{}
+	return &Config{SessionCapacity: 10000}
 }
 
 func parseUrl(rawUrl string) (*url.URL, error) {
@@ -87,10 +89,74 @@ func parseUrl(rawUrl string) (*url.URL, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !strings.HasPrefix(u.Scheme, "http") {
+	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, fmt.Errorf("%v is not a valid scheme", u.Scheme)
 	}
 	return u, nil
+}
+
+// validateCallbackURL accepts only exact http/https schemes and, for http,
+// only loopback hosts, so development can use a plain HTTP callback while any
+// deployed callback must be HTTPS.
+func validateCallbackURL(raw string) (*url.URL, error) {
+	if raw == "" {
+		return nil, errors.New("invalid empty callback url")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("invalid callback url scheme %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return nil, errors.New("invalid callback url: missing host")
+	}
+	if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
+		return nil, errors.New("callback url must use https except on loopback")
+	}
+	return u, nil
+}
+
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// ensureOpenIDScope guarantees the OIDC "openid" scope is present regardless
+// of any additional scopes the operator configured.
+func ensureOpenIDScope(scope string) string {
+	for _, field := range strings.Fields(scope) {
+		if field == "openid" {
+			return scope
+		}
+	}
+	if scope == "" {
+		return "openid"
+	}
+	return "openid " + scope
+}
+
+func parseIgnorePathPrefixes(raw string) ([]string, error) {
+	if raw == "" {
+		return []string{}, nil
+	}
+	parts := strings.Split(raw, ",")
+	prefixes := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, errors.New("invalid ignore path prefix: empty entry")
+		}
+		if !strings.HasPrefix(part, "/") {
+			return nil, fmt.Errorf("invalid ignore path prefix %q: must start with /", part)
+		}
+		prefixes = append(prefixes, part)
+	}
+	return prefixes, nil
 }
 
 func readSecretFiles(config *Config) error {
@@ -179,17 +245,6 @@ func readConfigEnv(config *Config) error {
 		}
 		config.IgnorePathPrefixes = strings.TrimSpace(ignorePathPrefixes)
 	}
-	if config.SilentRenewalEnv != "" {
-		silentRenewal := os.Getenv(config.SilentRenewalEnv)
-		if silentRenewal == "" {
-			return errors.New("SilentRenewalEnv referenced but NOT set")
-		}
-		silentRenewalBool, err := strconv.ParseBool(silentRenewal)
-		if err != nil {
-			return err
-		}
-		config.SilentRenewal = &silentRenewalBool
-	}
 	if config.RefreshBeforeExpiryEnv != "" {
 		refreshBeforeExpiry := os.Getenv(config.RefreshBeforeExpiryEnv)
 		if refreshBeforeExpiry == "" {
@@ -230,30 +285,38 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 		return nil, err
 	}
 
+	upstream := newUpstreamHTTPClient(config.InsecureSkipVerify)
+
 	keycloakURL := parsedURL
 	if config.LegacySupport {
-		compatUrl, err := setKeycloakCompatURL(parsedURL, config.KeycloakRealm, config.InsecureSkipVerify)
+		compatURL, err := setKeycloakCompatURL(uctx, upstream, parsedURL, config.KeycloakRealm)
 		if err != nil {
 			return nil, err
 		}
-		keycloakURL = compatUrl
+		keycloakURL = compatURL
 	}
 
-	if config.Scope == "" {
-		config.Scope = "openid"
+	var callbackURL *url.URL
+	if config.CallbackURL != "" {
+		callbackURL, err = validateCallbackURL(config.CallbackURL)
+		if err != nil {
+			return nil, err
+		}
 	}
+
+	sessionCapacity := config.SessionCapacity
+	if sessionCapacity <= 0 {
+		return nil, errors.New("invalid session capacity")
+	}
+
+	scope := ensureOpenIDScope(config.Scope)
 
 	if config.RefreshBeforeExpiry == "" {
 		config.RefreshBeforeExpiry = "30s"
 	}
-	refreshBeforeExpiry := 30 * time.Second
-	silentRenewal := config.SilentRenewal == nil || *config.SilentRenewal
-	if silentRenewal {
-		parsed, err := time.ParseDuration(config.RefreshBeforeExpiry)
-		if err != nil {
-			return nil, err
-		}
-		refreshBeforeExpiry = parsed
+	refreshBeforeExpiry, err := time.ParseDuration(config.RefreshBeforeExpiry)
+	if err != nil {
+		return nil, err
 	}
 
 	useAuthHeader := false
@@ -271,9 +334,9 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 		userHeaderName = config.UserHeaderName
 	}
 
-	ignorePathPrefixes := []string{}
-	if config.IgnorePathPrefixes != "" {
-		ignorePathPrefixes = strings.Split(config.IgnorePathPrefixes, ",")
+	ignorePathPrefixes, err := parseIgnorePathPrefixes(config.IgnorePathPrefixes)
+	if err != nil {
+		return nil, err
 	}
 
 	return &keycloakAuth{
@@ -283,59 +346,15 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 		ClientID:            config.ClientID,
 		ClientSecret:        config.ClientSecret,
 		KeycloakRealm:       config.KeycloakRealm,
-		Scope:               config.Scope,
+		Scope:               scope,
 		UseAuthHeader:       useAuthHeader,
 		UserClaimName:       userClaimName,
 		UserHeaderName:      userHeaderName,
 		IgnorePathPrefixes:  ignorePathPrefixes,
+		CallbackURL:         callbackURL,
+		SessionCapacity:     sessionCapacity,
 		SessionStore:        sharedSessionStore(strings.Join([]string{keycloakURL.String(), config.KeycloakRealm, config.ClientID}, "\x00")),
-		SilentRenewal:       silentRenewal,
 		RefreshBeforeExpiry: refreshBeforeExpiry,
+		upstream:            upstream,
 	}, nil
-}
-
-// setKeycloakCompatURL will test a couple well-known keycloak endpoints to determine if
-// the current keycloak instance is the older wildfly or the newer quarkus version and
-// and dynamically add /auth to the url as required.
-func setKeycloakCompatURL(keycloakURL *url.URL, realm string, skipVerify bool) (*url.URL, error) {
-
-	// default to newer quarkus by querying /realms/{realm}
-	target := keycloakURL.JoinPath("realms", realm)
-	fmt.Println("target: ", target.String())
-
-	// create a new http client
-	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: skipVerify},
-		},
-	}
-
-	// make a GET request to the target URL
-	resp, err := client.Get(target.String())
-	if err != nil {
-		return keycloakURL, err
-	}
-	defer resp.Body.Close()
-
-	// check status code
-	if resp.StatusCode == http.StatusOK {
-		return keycloakURL, nil
-	}
-
-	// if the status code is not 200, try the old wildfly URL
-	target = keycloakURL.JoinPath("auth", "realms", realm)
-
-	// make a GET request to the target URL
-	resp, err = client.Get(target.String())
-	if err != nil {
-		return keycloakURL, err
-	}
-	defer resp.Body.Close()
-
-	// check status code
-	if resp.StatusCode == http.StatusOK {
-		return keycloakURL.JoinPath("auth"), nil
-	}
-
-	return keycloakURL, errors.New("could not determine Keycloak compatibility")
 }

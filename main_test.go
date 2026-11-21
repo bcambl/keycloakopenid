@@ -29,10 +29,6 @@ type testKeycloak struct {
 	lastRefreshForm  url.Values
 }
 
-func boolPtr(v bool) *bool {
-	return &v
-}
-
 func tokenJSON(access, refresh string, expiresIn int) string {
 	return fmt.Sprintf(`{"access_token":%q,"refresh_token":%q,"expires_in":%d}`, access, refresh, expiresIn)
 }
@@ -104,6 +100,9 @@ func newTestMiddleware(t *testing.T, kc *testKeycloak, config Config) *keycloakA
 	}
 	config.ClientSecret = "s"
 	config.KeycloakRealm = "r"
+	if config.SessionCapacity == 0 {
+		config.SessionCapacity = 10000
+	}
 	config.UseAuthHeader = true
 	handler, err := New(context.Background(), http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
 		rw.WriteHeader(http.StatusOK)

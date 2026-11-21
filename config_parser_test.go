@@ -29,97 +29,195 @@ func newTestAuth(t *testing.T, config *Config) *keycloakAuth {
 	return auth
 }
 
-func TestConfigDefaultsSilentRenewal(t *testing.T) {
-	auth := newTestAuth(t, testConfig())
-	if !auth.SilentRenewal {
-		t.Fatal("SilentRenewal must default to true")
+func newConfigError(t *testing.T, config *Config) error {
+	t.Helper()
+	_, err := New(context.Background(), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), config, "test")
+	if err == nil {
+		t.Fatal("New returned nil error, want error")
 	}
+	return err
+}
+
+func TestConfigDefaultRefreshWindow(t *testing.T) {
+	auth := newTestAuth(t, testConfig())
 	if auth.RefreshBeforeExpiry != 30*time.Second {
 		t.Fatalf("RefreshBeforeExpiry = %v, want 30s", auth.RefreshBeforeExpiry)
 	}
 }
 
-func TestConfigExplicitFalseRestoresLegacy(t *testing.T) {
+func TestConfigRefreshWindowParsed(t *testing.T) {
 	config := testConfig()
-	config.SilentRenewal = boolPtr(false)
-	auth := newTestAuth(t, config)
-	if auth.SilentRenewal {
-		t.Fatal("SilentRenewal=false must restore legacy behavior")
-	}
-}
-
-func TestConfigSilentRenewalParsesWindow(t *testing.T) {
-	config := testConfig()
-	config.SilentRenewal = boolPtr(true)
 	config.RefreshBeforeExpiry = "45s"
 	auth := newTestAuth(t, config)
-	if !auth.SilentRenewal {
-		t.Fatal("SilentRenewal must be true")
-	}
 	if auth.RefreshBeforeExpiry != 45*time.Second {
 		t.Fatalf("RefreshBeforeExpiry = %v, want 45s", auth.RefreshBeforeExpiry)
 	}
 }
 
-func TestConfigSilentRenewalInvalidWindowRejected(t *testing.T) {
+func TestConfigInvalidRefreshWindowRejected(t *testing.T) {
 	config := testConfig()
-	config.SilentRenewal = boolPtr(true)
 	config.RefreshBeforeExpiry = "nope"
-	_, err := New(context.Background(), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), config, "test")
-	if err == nil {
-		t.Fatal("expected error for invalid RefreshBeforeExpiry with SilentRenewal enabled")
+	newConfigError(t, config)
+}
+
+func TestConfigDefaultSessionCapacity(t *testing.T) {
+	auth := newTestAuth(t, testConfig())
+	if auth.SessionCapacity != 10000 {
+		t.Fatalf("SessionCapacity = %d, want 10000", auth.SessionCapacity)
 	}
 }
 
-func TestConfigDefaultInvalidWindowRejected(t *testing.T) {
+func TestConfigZeroSessionCapacityRejected(t *testing.T) {
 	config := testConfig()
-	config.RefreshBeforeExpiry = "nope"
-	_, err := New(context.Background(), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), config, "test")
-	if err == nil {
-		t.Fatal("expected error for invalid RefreshBeforeExpiry with default silent renewal")
+	config.SessionCapacity = 0
+	newConfigError(t, config)
+}
+
+func TestConfigNegativeSessionCapacityRejected(t *testing.T) {
+	config := testConfig()
+	config.SessionCapacity = -1
+	newConfigError(t, config)
+}
+
+func TestConfigPositiveSessionCapacityAccepted(t *testing.T) {
+	config := testConfig()
+	config.SessionCapacity = 5
+	auth := newTestAuth(t, config)
+	if auth.SessionCapacity != 5 {
+		t.Fatalf("SessionCapacity = %d, want 5", auth.SessionCapacity)
 	}
 }
 
-func TestConfigInvalidWindowIgnoredWhenDisabled(t *testing.T) {
-	config := testConfig()
-	config.SilentRenewal = boolPtr(false)
-	config.RefreshBeforeExpiry = "nope"
-	newTestAuth(t, config)
+func TestConfigOpenIDScopeAlwaysIncluded(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", "openid"},
+		{"profile email", "openid profile email"},
+		{"openid profile", "openid profile"},
+		{"openid", "openid"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			config := testConfig()
+			config.Scope = tc.in
+			auth := newTestAuth(t, config)
+			if auth.Scope != tc.want {
+				t.Fatalf("Scope = %q, want %q", auth.Scope, tc.want)
+			}
+		})
+	}
 }
 
-func TestConfigEnvVariants(t *testing.T) {
-	t.Run("values populate", func(t *testing.T) {
-		t.Setenv("TEST_SILENT_RENEWAL", "true")
-		t.Setenv("TEST_REFRESH_WINDOW", "45s")
-		config := testConfig()
-		config.SilentRenewalEnv = "TEST_SILENT_RENEWAL"
-		config.RefreshBeforeExpiryEnv = "TEST_REFRESH_WINDOW"
-		auth := newTestAuth(t, config)
-		if !auth.SilentRenewal {
-			t.Fatal("SilentRenewal must be true from environment")
+func TestConfigIgnorePathPrefixesTrimmed(t *testing.T) {
+	config := testConfig()
+	config.IgnorePathPrefixes = " /api , /favicon.ico "
+	auth := newTestAuth(t, config)
+	want := []string{"/api", "/favicon.ico"}
+	if len(auth.IgnorePathPrefixes) != len(want) {
+		t.Fatalf("IgnorePathPrefixes = %v, want %v", auth.IgnorePathPrefixes, want)
+	}
+	for i := range want {
+		if auth.IgnorePathPrefixes[i] != want[i] {
+			t.Fatalf("IgnorePathPrefixes[%d] = %q, want %q", i, auth.IgnorePathPrefixes[i], want[i])
 		}
-		if auth.RefreshBeforeExpiry != 45*time.Second {
-			t.Fatalf("RefreshBeforeExpiry = %v, want 45s", auth.RefreshBeforeExpiry)
-		}
-	})
+	}
+}
 
-	t.Run("env false restores legacy", func(t *testing.T) {
-		t.Setenv("TEST_SILENT_RENEWAL", "false")
-		config := testConfig()
-		config.SilentRenewalEnv = "TEST_SILENT_RENEWAL"
-		auth := newTestAuth(t, config)
-		if auth.SilentRenewal {
-			t.Fatal("SilentRenewal=false from environment must restore legacy behavior")
-		}
-	})
+func TestConfigIgnorePathPrefixesRejectEmpty(t *testing.T) {
+	config := testConfig()
+	config.IgnorePathPrefixes = "/api,,/favicon.ico"
+	newConfigError(t, config)
+}
 
-	t.Run("referenced but unset", func(t *testing.T) {
-		t.Setenv("TEST_SILENT_RENEWAL_UNSET", "")
-		config := testConfig()
-		config.SilentRenewalEnv = "TEST_SILENT_RENEWAL_UNSET"
-		_, err := New(context.Background(), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), config, "test")
-		if err == nil {
-			t.Fatal("expected error when SilentRenewalEnv references an unset variable")
-		}
-	})
+func TestConfigIgnorePathPrefixesRejectMalformed(t *testing.T) {
+	config := testConfig()
+	config.IgnorePathPrefixes = "api"
+	newConfigError(t, config)
+}
+
+func TestKeycloakURLExactHTTPSchemes(t *testing.T) {
+	valid := []string{"http://kc.test", "https://kc.test", "http://127.0.0.1:8080"}
+	for _, raw := range valid {
+		t.Run("valid "+raw, func(t *testing.T) {
+			config := testConfig()
+			config.KeycloakURL = raw
+			newTestAuth(t, config)
+		})
+	}
+	invalid := []string{"ftp://kc.test", "httpsfoo://kc.test", "file:///etc/passwd"}
+	for _, raw := range invalid {
+		t.Run("invalid "+raw, func(t *testing.T) {
+			config := testConfig()
+			config.KeycloakURL = raw
+			newConfigError(t, config)
+		})
+	}
+}
+
+func TestCallbackURLHTTPSRequired(t *testing.T) {
+	config := testConfig()
+	config.CallbackURL = "http://app.test/callback"
+	newConfigError(t, config)
+}
+
+func TestCallbackURLLoopbackHTTPAllowed(t *testing.T) {
+	for _, raw := range []string{"http://127.0.0.1:8080/cb", "http://localhost/cb", "http://[::1]/cb"} {
+		t.Run(raw, func(t *testing.T) {
+			config := testConfig()
+			config.CallbackURL = raw
+			newTestAuth(t, config)
+		})
+	}
+}
+
+func TestCallbackURLHTTPSAllowed(t *testing.T) {
+	config := testConfig()
+	config.CallbackURL = "https://app.test/callback"
+	auth := newTestAuth(t, config)
+	if auth.CallbackURL == nil || auth.CallbackURL.String() != "https://app.test/callback" {
+		t.Fatalf("CallbackURL = %v, want https://app.test/callback", auth.CallbackURL)
+	}
+}
+
+func TestCallbackURLRejectsNonHTTPScheme(t *testing.T) {
+	config := testConfig()
+	config.CallbackURL = "ftp://app.test/cb"
+	newConfigError(t, config)
+}
+
+func TestValidateCallbackURL(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		wantErr bool
+	}{
+		{"https ok", "https://app.test/cb", false},
+		{"http loopback", "http://127.0.0.1/cb", false},
+		{"http localhost", "http://localhost/cb", false},
+		{"http non-loopback", "http://app.test/cb", true},
+		{"empty", "", true},
+		{"ftp", "ftp://app.test/cb", true},
+		{"no scheme", "app.test/cb", true},
+		{"httpsfoo", "httpsfoo://app.test/cb", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := validateCallbackURL(tc.raw)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validateCallbackURL(%q) err = %v, wantErr = %t", tc.raw, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestConfigEnvRefreshWindow(t *testing.T) {
+	t.Setenv("TEST_REFRESH_WINDOW", "45s")
+	config := testConfig()
+	config.RefreshBeforeExpiryEnv = "TEST_REFRESH_WINDOW"
+	auth := newTestAuth(t, config)
+	if auth.RefreshBeforeExpiry != 45*time.Second {
+		t.Fatalf("RefreshBeforeExpiry = %v, want 45s", auth.RefreshBeforeExpiry)
+	}
 }

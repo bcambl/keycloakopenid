@@ -50,92 +50,6 @@ func callbackState(t *testing.T, redirectURL string) string {
 	return base64.StdEncoding.EncodeToString([]byte(`{"redirect_url":"` + redirectURL + `"}`))
 }
 
-func TestServeHTTPLegacyNoSessionRedirect307(t *testing.T) {
-	kc := newTestKeycloak(t)
-	auth := newTestMiddleware(t, kc, Config{SilentRenewal: boolPtr(false)})
-	rw := httptest.NewRecorder()
-
-	auth.ServeHTTP(rw, newSessionRequest(http.MethodGet, "https://app.test/x", ""))
-
-	if rw.Code != http.StatusTemporaryRedirect {
-		t.Fatalf("status = %d, want 307", rw.Code)
-	}
-	if loc := rw.Header().Get("Location"); !strings.HasPrefix(loc, kc.srv.URL+"/realms/r/protocol/openid-connect/auth") {
-		t.Fatalf("Location = %q, want keycloak auth URL", loc)
-	}
-	if setCookie := rw.Header().Get("Set-Cookie"); setCookie != "" {
-		t.Fatalf("Set-Cookie = %q, want none", setCookie)
-	}
-}
-
-func TestServeHTTPLegacyStoreMissNoCookieClear(t *testing.T) {
-	kc := newTestKeycloak(t)
-	auth := newTestMiddleware(t, kc, Config{SilentRenewal: boolPtr(false)})
-	rw := httptest.NewRecorder()
-
-	auth.ServeHTTP(rw, newSessionRequest(http.MethodGet, "https://app.test/x", "unknown"))
-
-	if rw.Code != http.StatusTemporaryRedirect {
-		t.Fatalf("status = %d, want 307", rw.Code)
-	}
-	if setCookie := rw.Header().Get("Set-Cookie"); setCookie != "" {
-		t.Fatalf("Set-Cookie = %q, want none (legacy parity)", setCookie)
-	}
-}
-
-func TestServeHTTPLegacyInactiveClearsCookieAnd307(t *testing.T) {
-	kc := newTestKeycloak(t)
-	kc.introspectActive = false
-	auth := newTestMiddleware(t, kc, Config{SilentRenewal: boolPtr(false)})
-	auth.SessionStore.Set("known", &Session{AccessToken: "old", ExpiresAt: time.Now().Add(time.Hour)})
-	rw := httptest.NewRecorder()
-
-	auth.ServeHTTP(rw, newSessionRequest(http.MethodGet, "https://app.test/x", "known"))
-
-	if rw.Code != http.StatusTemporaryRedirect {
-		t.Fatalf("status = %d, want 307", rw.Code)
-	}
-	setCookie := rw.Header().Get("Set-Cookie")
-	if !strings.Contains(setCookie, "SessionID=;") || !strings.Contains(setCookie, "Max-Age=0") {
-		t.Fatalf("Set-Cookie = %q, want cleared SessionID", setCookie)
-	}
-}
-
-func TestServeHTTPLegacyNeverRefreshes(t *testing.T) {
-	kc := newTestKeycloak(t)
-	auth := newTestMiddleware(t, kc, Config{SilentRenewal: boolPtr(false)})
-	next := &capturedNext{}
-	next.install(auth)
-	auth.SessionStore.Set("known", &Session{AccessToken: jwtWithClaims(`{"preferred_username":"alice"}`), ExpiresAt: time.Now().Add(10 * time.Second)})
-	rw := httptest.NewRecorder()
-
-	auth.ServeHTTP(rw, newSessionRequest(http.MethodGet, "https://app.test/x", "known"))
-
-	if !next.called {
-		t.Fatal("expected request to reach the next handler")
-	}
-	if got := kc.refreshCalls(); got != 0 {
-		t.Fatalf("refreshCount = %d, want 0 in legacy mode", got)
-	}
-	if rw.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rw.Code)
-	}
-}
-
-func TestServeHTTPLegacyIntrospectionTransportError500(t *testing.T) {
-	kc := newTestKeycloak(t)
-	auth := newTestMiddleware(t, kc, Config{SilentRenewal: boolPtr(false)})
-	auth.SessionStore.Set("known", &Session{AccessToken: "old", ExpiresAt: time.Now().Add(time.Hour)})
-	kc.srv.Close()
-	rw := httptest.NewRecorder()
-
-	auth.ServeHTTP(rw, newSessionRequest(http.MethodGet, "https://app.test/x", "known"))
-
-	if rw.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500 (legacy parity)", rw.Code)
-	}
-}
-
 func TestServeHTTPRenewalCallback303StoresTokens(t *testing.T) {
 	kc := newTestKeycloak(t)
 	auth := newTestMiddleware(t, kc, Config{})
@@ -234,34 +148,6 @@ func TestServeHTTPSessionNotSharedAcrossClients(t *testing.T) {
 
 	if rw.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401; a session issued to one client must not authorize another", rw.Code)
-	}
-}
-
-func TestServeHTTPLegacyCallback307OneHourExpiry(t *testing.T) {
-	kc := newTestKeycloak(t)
-	auth := newTestMiddleware(t, kc, Config{SilentRenewal: boolPtr(false)})
-	rw := httptest.NewRecorder()
-	state := callbackState(t, "https://app.test/x")
-
-	auth.ServeHTTP(rw, newSessionRequest(http.MethodGet, "https://app.test/x?code=abc&state="+state, ""))
-
-	if rw.Code != http.StatusTemporaryRedirect {
-		t.Fatalf("status = %d, want 307 (legacy parity)", rw.Code)
-	}
-	cookies := rw.Result().Cookies()
-	if len(cookies) != 1 || cookies[0].Name != "SessionID" {
-		t.Fatalf("cookies = %v, want one SessionID", cookies)
-	}
-	session, ok := auth.SessionStore.Get(cookies[0].Value)
-	if !ok {
-		t.Fatal("expected stored session for new cookie")
-	}
-	remaining := time.Until(session.ExpiresAt)
-	if remaining < 55*time.Minute || remaining > 65*time.Minute {
-		t.Fatalf("ExpiresAt is %v away, want about 1h (legacy parity)", remaining)
-	}
-	if session.RefreshToken != "" {
-		t.Fatalf("RefreshToken = %q, want empty in legacy mode", session.RefreshToken)
 	}
 }
 
@@ -571,25 +457,6 @@ func TestServeHTTPRenewalNoCookiePOST401(t *testing.T) {
 
 	if rw.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", rw.Code)
-	}
-}
-
-func TestServeHTTPLegacyCallbackNon200ErrorBody(t *testing.T) {
-	kc := newTestKeycloak(t)
-	kc.tokenStatus = http.StatusBadRequest
-	kc.tokenBody = `{"error":"x"}`
-	auth := newTestMiddleware(t, kc, Config{SilentRenewal: boolPtr(false)})
-	rw := httptest.NewRecorder()
-	state := callbackState(t, "https://app.test/x")
-
-	auth.ServeHTTP(rw, newSessionRequest(http.MethodGet, "https://app.test/x?code=abc&state="+state, ""))
-
-	if rw.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500", rw.Code)
-	}
-	want := "received bad response from Keycloak: {\"error\":\"x\"}\n"
-	if rw.Body.String() != want {
-		t.Fatalf("body = %q, want %q (legacy parity)", rw.Body.String(), want)
 	}
 }
 

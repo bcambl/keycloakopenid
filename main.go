@@ -2,7 +2,6 @@ package keycloakopenid
 
 import (
 	"crypto/rand"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -52,10 +51,7 @@ func isNavigationRequest(req *http.Request) bool {
 }
 
 func (k *keycloakAuth) redirectStatus() int {
-	if k.SilentRenewal {
-		return http.StatusSeeOther
-	}
-	return http.StatusTemporaryRedirect
+	return http.StatusSeeOther
 }
 
 func (k *keycloakAuth) writeUnauthorized(rw http.ResponseWriter) {
@@ -66,7 +62,7 @@ func (k *keycloakAuth) writeUnauthorized(rw http.ResponseWriter) {
 }
 
 func (k *keycloakAuth) requireAuthentication(rw http.ResponseWriter, req *http.Request) {
-	if k.SilentRenewal && !isNavigationRequest(req) {
+	if !isNavigationRequest(req) {
 		k.writeUnauthorized(rw)
 		return
 	}
@@ -94,21 +90,7 @@ func (k *keycloakAuth) forwardSession(rw http.ResponseWriter, req *http.Request,
 
 func (k *keycloakAuth) serveSession(rw http.ResponseWriter, req *http.Request, session *Session) {
 	accessToken, _, expiresAt := session.snapshot()
-	status, err := k.introspectToken(accessToken)
-
-	if !k.SilentRenewal {
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		if status != tokenActive {
-			k.clearSessionCookie(rw)
-			k.redirectToKeycloak(rw, req)
-			return
-		}
-		k.forwardSession(rw, req, accessToken)
-		return
-	}
+	status, _ := k.introspectToken(accessToken)
 
 	if status == tokenUnavailable {
 		http.Error(rw, "Keycloak introspection unavailable", http.StatusBadGateway)
@@ -147,10 +129,8 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			k.serveSession(rw, req, session)
 			return
 		}
-		if k.SilentRenewal {
-			k.terminateSession(rw, req)
-			return
-		}
+		k.terminateSession(rw, req)
+		return
 	}
 
 	authCode := req.URL.Query().Get("code")
@@ -171,17 +151,16 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	session := &Session{AccessToken: tokenResponse.AccessToken}
-	if k.SilentRenewal {
-		if tokenResponse.RefreshToken == "" || tokenResponse.ExpiresIn <= 0 {
-			http.Error(rw, "Keycloak token response cannot be silently renewed: refresh_token and expires_in are required", http.StatusInternalServerError)
-			return
-		}
-		session.RefreshToken = tokenResponse.RefreshToken
-		session.ExpiresAt = time.Now().Add(time.Duration(tokenResponse.ExpiresIn) * time.Second)
-		session.RefreshExpiresAt = refreshExpiry(tokenResponse)
-	} else {
-		session.ExpiresAt = time.Now().Add(time.Hour)
+	if tokenResponse.RefreshToken == "" || tokenResponse.ExpiresIn <= 0 {
+		http.Error(rw, "Keycloak token response cannot be silently renewed: refresh_token and expires_in are required", http.StatusInternalServerError)
+		return
+	}
+
+	session := &Session{
+		AccessToken:      tokenResponse.AccessToken,
+		RefreshToken:     tokenResponse.RefreshToken,
+		ExpiresAt:        time.Now().Add(time.Duration(tokenResponse.ExpiresIn) * time.Second),
+		RefreshExpiresAt: refreshExpiry(tokenResponse),
 	}
 
 	sessionID, err := generateSessionID()
@@ -253,9 +232,7 @@ func (k *keycloakAuth) exchangeAuthCode(authCode, stateBase64 string) (*Keycloak
 		"token",
 	)
 
-	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: k.InsecureSkipVerify}
-
-	resp, err := http.PostForm(target.String(),
+	resp, err := k.upstream.PostForm(target.String(),
 		url.Values{
 			"grant_type":    {"authorization_code"},
 			"client_id":     {k.ClientID},
@@ -310,12 +287,7 @@ func (k *keycloakAuth) refreshAccessToken(refreshToken string) (*KeycloakTokenRe
 		"token",
 	)
 
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: k.InsecureSkipVerify},
-	}
-	client := &http.Client{Transport: tr}
-
-	resp, err := client.PostForm(target.String(), url.Values{
+	resp, err := k.upstream.PostForm(target.String(), url.Values{
 		"grant_type":    {"refresh_token"},
 		"client_id":     {k.ClientID},
 		"client_secret": {k.ClientSecret},
@@ -415,20 +387,13 @@ const (
 )
 
 func (k *keycloakAuth) introspectToken(token string) (tokenStatus, error) {
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: k.InsecureSkipVerify},
-	}
-
-	client := &http.Client{Transport: tr}
-
 	data := url.Values{
 		"token":         {token},
 		"client_id":     {k.ClientID},
 		"client_secret": {k.ClientSecret},
 	}
 
-	req, err := http.NewRequest(
-		http.MethodPost,
+	resp, err := k.upstream.PostForm(
 		k.KeycloakURL.JoinPath(
 			"realms",
 			k.KeycloakRealm,
@@ -437,15 +402,8 @@ func (k *keycloakAuth) introspectToken(token string) (tokenStatus, error) {
 			"token",
 			"introspect",
 		).String(),
-		strings.NewReader(data.Encode()),
+		data,
 	)
-	if err != nil {
-		return tokenUnavailable, err
-	}
-
-	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := client.Do(req)
 	if err != nil {
 		return tokenUnavailable, err
 	}
