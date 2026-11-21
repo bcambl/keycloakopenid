@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"io"
@@ -271,7 +272,7 @@ func (k *keycloakAuth) serveSession(rw http.ResponseWriter, req *http.Request, s
 	}
 
 	if needsRenewal {
-		if err := k.renewSession(req.Context(), session, force); err != nil {
+		if err := k.renewSession(req.Context(), session, accessToken, force); err != nil {
 			if isOIDCRefusal(err) {
 				k.terminateSession(rw, req, sessionID)
 				return
@@ -286,32 +287,58 @@ func (k *keycloakAuth) serveSession(rw http.ResponseWriter, req *http.Request, s
 	k.forwardSession(rw, req, session)
 }
 
-// renewSession refreshes the session under its lock, rejecting a refreshed
-// identity whose subject differs from the established subject. When force is
-// false, a concurrent caller that already renewed the session to a fresh
-// expiry causes this call to be skipped.
-func (k *keycloakAuth) renewSession(ctx context.Context, session *Session, force bool) error {
+// renewSession refreshes the session under its lock. A concurrent caller that
+// already rotated the observed access token makes this call a no-op.
+func (k *keycloakAuth) renewSession(ctx context.Context, session *Session, observedAccessToken string, force bool) error {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 
+	if session.AccessToken != observedAccessToken {
+		return nil
+	}
 	if !force && time.Until(session.ExpiresAt) > k.RefreshBeforeExpiry {
 		return nil
 	}
 
-	refreshToken := session.RefreshToken
-	subject := session.Subject
-
-	ts, err := k.oidc.refresh(ctx, refreshToken)
+	ts, err := k.oidc.refresh(ctx, session.RefreshToken)
 	if err != nil {
 		return err
 	}
 
-	if ts.Identity.Subject != "" && subject != "" && ts.Identity.Subject != subject {
-		return newOIDCError(oidcErrRefusal, errors.New("oidc: refresh changed the session subject"))
+	if ts.Identity.Subject != "" {
+		if ts.Identity.Subject != session.Subject {
+			return newOIDCError(oidcErrRefusal, errors.New("oidc: refresh changed the session subject"))
+		}
+		if ts.Identity.Nonce != "" && subtle.ConstantTimeCompare([]byte(ts.Identity.Nonce), []byte(session.Nonce)) != 1 {
+			return newOIDCError(oidcErrRefusal, errors.New("oidc: refresh changed the session nonce"))
+		}
+		if !sameAudienceSet(session.Audience, ts.Identity.Audience) {
+			return newOIDCError(oidcErrRefusal, errors.New("oidc: refresh changed the session audience"))
+		}
 	}
 
 	session.applyTokenSetLocked(ts)
 	return nil
+}
+
+func sameAudienceSet(first, second []string) bool {
+	firstSet := make(map[string]struct{}, len(first))
+	secondSet := make(map[string]struct{}, len(second))
+	for _, audience := range first {
+		firstSet[audience] = struct{}{}
+	}
+	for _, audience := range second {
+		secondSet[audience] = struct{}{}
+	}
+	if len(firstSet) != len(secondSet) {
+		return false
+	}
+	for audience := range firstSet {
+		if _, ok := secondSet[audience]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // forwardSession sets the validated user and, when configured, the bearer

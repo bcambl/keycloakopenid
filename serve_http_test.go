@@ -643,6 +643,80 @@ func TestNearExpiryRenewsProactively(t *testing.T) {
 	}
 }
 
+func TestConcurrentForcedRenewalRefreshesOnceAcrossMiddlewareInstances(t *testing.T) {
+	resetSharedStores()
+	p := newOIDCTestProvider(t)
+	mutate := func(c *Config) { c.UseAuthHeader = true }
+	first := newAuth(t, p, mutate)
+	second := newAuth(t, p, mutate)
+	first.SessionStore.Set("known", &Session{
+		AccessToken:  "old",
+		RefreshToken: "old-refresh",
+		ExpiresAt:    time.Now().Add(time.Hour),
+		Subject:      "user-123",
+		Claims:       map[string]any{"preferred_username": "alice"},
+	})
+	p.introspectBody = `{"active":false}`
+	p.introspectObserved = make(chan struct{}, 2)
+	p.introspectRelease = make(chan struct{})
+	p.tokenStarted = make(chan struct{})
+	p.tokenRelease = make(chan struct{})
+	p.setToken(marshalTokenResponse("new-access", "new-refresh", "", 300, nil))
+
+	type result struct {
+		status int
+		authz  string
+	}
+	results := make(chan result, 2)
+	run := func(auth *keycloakAuth, cap *capture) {
+		auth.next = cap.handler()
+		rw := httptest.NewRecorder()
+		req := apiGet("https://app.test/dashboard")
+		req.AddCookie(&http.Cookie{Name: sessionCookieName(auth.clientKey), Value: "known"})
+		auth.ServeHTTP(rw, req)
+		results <- result{status: rw.Code, authz: cap.authz}
+	}
+	wait := func(signal <-chan struct{}) {
+		t.Helper()
+		select {
+		case <-signal:
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for concurrent request")
+		}
+	}
+
+	firstCapture := &capture{}
+	go run(first, firstCapture)
+	wait(p.introspectObserved)
+	secondCapture := &capture{}
+	go run(second, secondCapture)
+	wait(p.introspectObserved)
+	close(p.introspectRelease)
+	wait(p.tokenStarted)
+	close(p.tokenRelease)
+
+	for range 2 {
+		got := <-results
+		if got.status != http.StatusOK {
+			t.Fatalf("status = %d, want 200", got.status)
+		}
+		if got.authz != "Bearer new-access" {
+			t.Fatalf("Authorization = %q, want rotated access token", got.authz)
+		}
+	}
+	if got := p.tokenRequestCount(); got != 1 {
+		t.Fatalf("token requests = %d, want exactly 1", got)
+	}
+	session, ok := first.SessionStore.Get("known")
+	if !ok {
+		t.Fatal("renewed session must remain stored")
+	}
+	accessToken, refreshToken, _ := session.snapshot()
+	if accessToken != "new-access" || refreshToken != "new-refresh" {
+		t.Fatalf("session tokens = %q/%q, want rotated tokens", accessToken, refreshToken)
+	}
+}
+
 // TestOutageActiveProceedsInactive502 checks outage handling for both token
 // states.
 func TestOutageActiveProceedsInactive502(t *testing.T) {
@@ -750,6 +824,47 @@ func TestRefreshRefusalEndsSession(t *testing.T) {
 	}
 }
 
+func TestNonInvalidGrantRefreshErrorsRetainSession(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"invalid client", http.StatusUnauthorized, `{"error":"invalid_client"}`},
+		{"invalid request", http.StatusBadRequest, `{"error":"invalid_request"}`},
+		{"bodyless bad request", http.StatusBadRequest, ""},
+		{"malformed bad request", http.StatusBadRequest, "not json"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newOIDCTestProvider(t)
+			auth := newAuth(t, p, nil)
+			auth.SessionStore.Set("known", &Session{
+				AccessToken:  "old",
+				RefreshToken: "rt1",
+				ExpiresAt:    time.Now().Add(time.Hour),
+				Subject:      "user-123",
+				Claims:       map[string]any{"preferred_username": "alice"},
+			})
+			p.introspectBody = `{"active":false}`
+			p.tokenStatus = tc.status
+			p.setToken(tc.body)
+
+			rw := httptest.NewRecorder()
+			req := apiGet("https://app.test/dashboard")
+			req.AddCookie(&http.Cookie{Name: sessionCookieName(auth.clientKey), Value: "known"})
+			auth.ServeHTTP(rw, req)
+
+			if rw.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502", rw.Code)
+			}
+			if _, ok := auth.SessionStore.Get("known"); !ok {
+				t.Fatal("non-invalid_grant refresh error must retain the session")
+			}
+		})
+	}
+}
+
 // TestRefreshRejectsSubjectChange proves a refresh that returns a different
 // subject is rejected and ends the session.
 func TestRefreshRejectsSubjectChange(t *testing.T) {
@@ -779,6 +894,78 @@ func TestRefreshRejectsSubjectChange(t *testing.T) {
 	}
 	if _, ok := auth.SessionStore.Get("known"); ok {
 		t.Fatal("session with a changed subject must be terminated")
+	}
+}
+
+func TestRefreshIDTokenBinding(t *testing.T) {
+	cases := []struct {
+		name           string
+		setNonce       bool
+		mismatchNonce  bool
+		changeAudience bool
+		wantStatus     int
+		wantSession    bool
+	}{
+		{"matching nonce", true, false, false, http.StatusOK, true},
+		{"mismatching nonce", true, true, false, http.StatusUnauthorized, false},
+		{"omitted nonce", false, false, false, http.StatusOK, true},
+		{"changed audience", false, false, true, http.StatusUnauthorized, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newOIDCTestProvider(t)
+			auth := newAuth(t, p, func(c *Config) { c.UseAuthHeader = true })
+			sessionID := completeLogin(t, auth, p, "/")
+			session, ok := auth.SessionStore.Get(sessionID)
+			if !ok {
+				t.Fatal("initial session must be stored")
+			}
+			initialNonce, ok := session.Claims["nonce"].(string)
+			if !ok || initialNonce == "" {
+				t.Fatal("initial session must retain the validated nonce claim")
+			}
+			cap := &capture{}
+			auth.next = cap.handler()
+
+			claims := p.baseClaims()
+			claims["preferred_username"] = "alice"
+			if tc.setNonce {
+				claims["nonce"] = initialNonce
+				if tc.mismatchNonce {
+					claims["nonce"] = "different-nonce"
+				}
+			}
+			if tc.changeAudience {
+				claims["aud"] = []string{p.clientID, "other-audience"}
+				claims["azp"] = p.clientID
+			}
+			p.introspectBody = `{"active":false}`
+			p.setToken(marshalTokenResponse("new-access", "new-refresh", p.signIDToken(claims), 300, nil))
+
+			rw := httptest.NewRecorder()
+			req := apiGet("https://app.test/dashboard")
+			req.AddCookie(&http.Cookie{Name: sessionCookieName(auth.clientKey), Value: sessionID})
+			auth.ServeHTTP(rw, req)
+
+			if rw.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", rw.Code, tc.wantStatus)
+			}
+			_, stored := auth.SessionStore.Get(sessionID)
+			if stored != tc.wantSession {
+				t.Fatalf("session stored = %t, want %t", stored, tc.wantSession)
+			}
+			accessToken, _, _ := session.snapshot()
+			if tc.wantSession {
+				if !cap.called || cap.authz != "Bearer new-access" {
+					t.Fatalf("called = %t, Authorization = %q; want rotated token", cap.called, cap.authz)
+				}
+				if accessToken != "new-access" {
+					t.Fatalf("AccessToken = %q, want new-access", accessToken)
+				}
+			} else if accessToken != "access-token" {
+				t.Fatalf("AccessToken = %q, want original token retained on binding mismatch", accessToken)
+			}
+		})
 	}
 }
 

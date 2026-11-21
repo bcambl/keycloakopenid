@@ -44,12 +44,19 @@ type oidcTestProvider struct {
 	jwksBody     string
 	jwksRequests int
 
-	tokenStatus int
-	tokenBody   string
-	tokenForm   url.Values
+	tokenStatus      int
+	tokenBody        string
+	tokenContentType string
+	tokenForm        url.Values
+	tokenRequests    int
+	tokenStarted     chan struct{}
+	tokenRelease     chan struct{}
 
-	introspectStatus int
-	introspectBody   string
+	introspectStatus   int
+	introspectBody     string
+	introspectRequests int
+	introspectObserved chan struct{}
+	introspectRelease  chan struct{}
 }
 
 func newOIDCTestProvider(t *testing.T) *oidcTestProvider {
@@ -135,20 +142,41 @@ func (p *oidcTestProvider) serveToken(rw http.ResponseWriter, req *http.Request)
 	}
 	p.mu.Lock()
 	p.tokenForm = req.PostForm
+	p.tokenRequests++
+	requestNumber := p.tokenRequests
 	status := p.tokenStatus
 	body := p.tokenBody
+	contentType := p.tokenContentType
+	started := p.tokenStarted
+	release := p.tokenRelease
 	p.mu.Unlock()
 
-	rw.Header().Set("Content-Type", "application/json")
+	if requestNumber == 1 && started != nil {
+		close(started)
+		<-release
+	}
+	if contentType == "" {
+		contentType = "application/json"
+	}
+	rw.Header().Set("Content-Type", contentType)
 	rw.WriteHeader(status)
 	_, _ = rw.Write([]byte(body))
 }
 
 func (p *oidcTestProvider) serveIntrospect(rw http.ResponseWriter) {
 	p.mu.Lock()
+	p.introspectRequests++
 	status := p.introspectStatus
 	body := p.introspectBody
+	observed := p.introspectObserved
+	release := p.introspectRelease
 	p.mu.Unlock()
+	if observed != nil {
+		observed <- struct{}{}
+	}
+	if release != nil {
+		<-release
+	}
 	if body == "" {
 		body = `{"active":true}`
 	}
@@ -209,6 +237,12 @@ func (p *oidcTestProvider) jwksRequestCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.jwksRequests
+}
+
+func (p *oidcTestProvider) tokenRequestCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.tokenRequests
 }
 
 func (p *oidcTestProvider) capturedForm() url.Values {
@@ -879,6 +913,8 @@ func TestExchangeRejectsInvalidTimeClaims(t *testing.T) {
 		mutate func(map[string]any)
 	}{
 		{"missing expiry", func(claims map[string]any) { delete(claims, "exp") }},
+		{"missing issued at", func(claims map[string]any) { delete(claims, "iat") }},
+		{"invalid issued at", func(claims map[string]any) { claims["iat"] = "not-a-number" }},
 		{"not before beyond skew", func(claims map[string]any) {
 			claims["nbf"] = time.Now().Add(2 * time.Minute).Unix()
 		}},
@@ -1194,6 +1230,104 @@ func TestRefreshRejectsBadIDTokenSignature(t *testing.T) {
 	wantOIDCError(t, err, oidcErrMalformed)
 }
 
+func TestRefreshRequiresValidIssuedAt(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{"missing", func(claims map[string]any) { delete(claims, "iat") }},
+		{"invalid", func(claims map[string]any) { claims["iat"] = "not-a-number" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newOIDCTestProvider(t)
+			c := p.newClient(t)
+			claims := p.baseClaims()
+			tc.mutate(claims)
+			p.setToken(marshalTokenResponse("access", "refresh", p.signIDToken(claims), 300, nil))
+
+			_, err := c.refresh(context.Background(), "old-refresh-token")
+			wantOIDCError(t, err, oidcErrMalformed)
+		})
+	}
+}
+
+func TestTokenFlowsRequirePositiveExpiresIn(t *testing.T) {
+	lifetimes := []struct {
+		name  string
+		value int
+		omit  bool
+	}{
+		{"omitted", 0, true},
+		{"zero", 0, false},
+		{"negative", -1, false},
+	}
+	for _, flow := range []string{"exchange", "refresh"} {
+		for _, lifetime := range lifetimes {
+			t.Run(flow+"/"+lifetime.name, func(t *testing.T) {
+				p := newOIDCTestProvider(t)
+				c := p.newClient(t)
+				response := map[string]any{
+					"access_token":  "access",
+					"refresh_token": "refresh",
+				}
+				if !lifetime.omit {
+					response["expires_in"] = lifetime.value
+				}
+				if flow == "exchange" {
+					claims := p.baseClaims()
+					claims["nonce"] = "n0nce"
+					response["id_token"] = p.signIDToken(claims)
+				}
+				p.setToken(mustJSON(response))
+
+				var err error
+				if flow == "exchange" {
+					_, err = c.exchange(context.Background(), "code", "verifier", "n0nce")
+				} else {
+					_, err = c.refresh(context.Background(), "old-refresh-token")
+				}
+				wantOIDCError(t, err, oidcErrMalformed)
+			})
+		}
+	}
+}
+
+func TestTokenFlowsAcceptFormEncodedExpiresIn(t *testing.T) {
+	for _, flow := range []string{"exchange", "refresh"} {
+		t.Run(flow, func(t *testing.T) {
+			p := newOIDCTestProvider(t)
+			c := p.newClient(t)
+			response := url.Values{
+				"access_token":  {"access"},
+				"refresh_token": {"refresh"},
+				"expires_in":    {"300"},
+			}
+			if flow == "exchange" {
+				claims := p.baseClaims()
+				claims["nonce"] = "n0nce"
+				response.Set("id_token", p.signIDToken(claims))
+			}
+			p.tokenContentType = "application/x-www-form-urlencoded"
+			p.setToken(response.Encode())
+
+			var ts *tokenSet
+			var err error
+			if flow == "exchange" {
+				ts, err = c.exchange(context.Background(), "code", "verifier", "n0nce")
+			} else {
+				ts, err = c.refresh(context.Background(), "old-refresh-token")
+			}
+			if err != nil {
+				t.Fatalf("%s returned error: %v", flow, err)
+			}
+			if ts.ExpiresIn != 300 {
+				t.Fatalf("ExpiresIn = %d, want 300", ts.ExpiresIn)
+			}
+		})
+	}
+}
+
 func TestRefreshExpirySemantics(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -1256,6 +1390,33 @@ func TestRefreshRefusalClassifiedWithoutBodyLeak(t *testing.T) {
 	}
 }
 
+func TestRefreshNonInvalidGrantErrorsAreNotRefusals(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"invalid client", http.StatusUnauthorized, `{"error":"invalid_client"}`},
+		{"invalid request", http.StatusBadRequest, `{"error":"invalid_request"}`},
+		{"bodyless bad request", http.StatusBadRequest, ""},
+		{"malformed bad request", http.StatusBadRequest, "not json"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newOIDCTestProvider(t)
+			c := p.newClient(t)
+			p.tokenStatus = tc.status
+			p.setToken(tc.body)
+
+			_, err := c.refresh(context.Background(), "old-refresh-token")
+			wantOIDCError(t, err, oidcErrMalformed)
+			if isOIDCRefusal(err) {
+				t.Fatal("only invalid_grant may be classified as a refusal")
+			}
+		})
+	}
+}
+
 func TestRefreshOutageClassified(t *testing.T) {
 	p := newOIDCTestProvider(t)
 	c := p.newClient(t)
@@ -1292,6 +1453,7 @@ func TestIntrospectStatuses(t *testing.T) {
 		{"refusal", http.StatusUnauthorized, `{"error":"invalid_client"}`, tokenUnavailable, oidcErrRefusal},
 		{"outage", http.StatusInternalServerError, `oops`, tokenUnavailable, oidcErrOutage},
 		{"malformed", http.StatusOK, `not json`, tokenUnavailable, oidcErrMalformed},
+		{"multiple objects", http.StatusOK, `{"active":true}{"active":false}`, tokenUnavailable, oidcErrMalformed},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

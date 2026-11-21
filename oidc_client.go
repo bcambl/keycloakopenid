@@ -53,8 +53,10 @@ type validatedIDToken struct {
 
 // identity carries the validated claims of a signed ID token.
 type identity struct {
-	Subject string
-	Claims  map[string]any
+	Subject  string
+	Nonce    string
+	Audience []string
+	Claims   map[string]any
 }
 
 // tokenSet carries the tokens and validated identity produced by an exchange
@@ -360,6 +362,10 @@ func (c *oidcClient) validateIDToken(ctx context.Context, rawID, accessToken str
 	if err != nil {
 		return nil, newOIDCError(oidcErrMalformed, errors.New("oidc: id token has invalid audience"))
 	}
+	issuedAt, err := claims.GetIssuedAt()
+	if err != nil || issuedAt == nil {
+		return nil, newOIDCError(oidcErrMalformed, errors.New("oidc: id token missing valid issued at"))
+	}
 	nonce, err := idTokenStringClaim(claims, "nonce")
 	if err != nil {
 		return nil, newOIDCError(oidcErrMalformed, err)
@@ -436,6 +442,13 @@ func verifyAccessTokenHash(accessToken, expected, alg string) error {
 }
 
 func (c *oidcClient) buildTokenSet(tok *oauth2.Token, idToken *validatedIDToken) (*tokenSet, error) {
+	expiresIn := tok.ExpiresIn
+	if formExpiresIn, ok := tok.Extra("expires_in").(int64); ok {
+		expiresIn = formExpiresIn
+	}
+	if expiresIn <= 0 {
+		return nil, newOIDCError(oidcErrMalformed, errors.New("oidc: token response missing valid expires_in"))
+	}
 	refreshExp, err := refreshExpirySeconds(tok)
 	if err != nil {
 		return nil, newOIDCError(oidcErrMalformed, err)
@@ -444,11 +457,16 @@ func (c *oidcClient) buildTokenSet(tok *oauth2.Token, idToken *validatedIDToken)
 	ts := &tokenSet{
 		AccessToken:      tok.AccessToken,
 		RefreshToken:     tok.RefreshToken,
-		ExpiresIn:        int(tok.ExpiresIn),
+		ExpiresIn:        int(expiresIn),
 		RefreshExpiresIn: refreshExp,
 	}
 	if idToken != nil {
-		ts.Identity = identity{Subject: idToken.Subject, Claims: map[string]any(idToken.Claims)}
+		ts.Identity = identity{
+			Subject:  idToken.Subject,
+			Nonce:    idToken.Nonce,
+			Audience: append([]string(nil), idToken.Audience...),
+			Claims:   map[string]any(idToken.Claims),
+		}
 	}
 	return ts, nil
 }
@@ -458,14 +476,18 @@ func (c *oidcClient) buildTokenSet(tok *oauth2.Token, idToken *validatedIDToken)
 // otherwise. A negative value is invalid.
 func refreshExpirySeconds(tok *oauth2.Token) (*int, error) {
 	v := tok.Extra("refresh_expires_in")
-	if v == nil {
+	if v == nil || v == "" {
 		return nil, nil
 	}
-	f, ok := v.(float64)
-	if !ok {
+	var i int
+	switch value := v.(type) {
+	case float64:
+		i = int(value)
+	case int64:
+		i = int(value)
+	default:
 		return nil, errors.New("oidc: invalid refresh_expires_in")
 	}
-	i := int(f)
 	if i < 0 {
 		return nil, errors.New("oidc: invalid refresh_expires_in")
 	}
@@ -483,7 +505,7 @@ func sanitizeOAuthErr(err error) error {
 	if errors.As(err, &re) {
 		code := re.Response.StatusCode
 		switch {
-		case code == http.StatusBadRequest || code == http.StatusUnauthorized:
+		case re.ErrorCode == "invalid_grant":
 			return newOIDCError(oidcErrRefusal, fmt.Errorf("oidc: token endpoint refused the request (status %d)", code))
 		case code >= 500:
 			return newOIDCError(oidcErrOutage, fmt.Errorf("oidc: token endpoint unavailable (status %d)", code))
@@ -521,7 +543,12 @@ func (c *oidcClient) introspect(ctx context.Context, accessToken string) (tokenS
 		var r struct {
 			Active bool `json:"active"`
 		}
-		if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		decoder := json.NewDecoder(resp.Body)
+		if err := decoder.Decode(&r); err != nil {
+			return tokenUnavailable, newOIDCError(oidcErrMalformed, errors.New("oidc: malformed introspection response"))
+		}
+		var extra any
+		if err := decoder.Decode(&extra); err != io.EOF {
 			return tokenUnavailable, newOIDCError(oidcErrMalformed, errors.New("oidc: malformed introspection response"))
 		}
 		if r.Active {

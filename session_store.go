@@ -16,6 +16,8 @@ type Session struct {
 	ExpiresAt        time.Time
 	RefreshExpiresAt time.Time
 	Subject          string
+	Nonce            string
+	Audience         []string
 	Claims           map[string]any
 }
 
@@ -70,6 +72,10 @@ func (s *Session) applyTokenSetLocked(ts *tokenSet) {
 	}
 
 	if ts.Identity.Subject != "" {
+		if s.Subject == "" {
+			s.Nonce = ts.Identity.Nonce
+			s.Audience = append([]string(nil), ts.Identity.Audience...)
+		}
 		s.Subject = ts.Identity.Subject
 		s.Claims = ts.Identity.Claims
 	}
