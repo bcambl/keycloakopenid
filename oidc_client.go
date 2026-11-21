@@ -58,6 +58,15 @@ type tokenSet struct {
 	Identity         identity
 }
 
+// tokenStatus classifies the result of introspecting an access token.
+type tokenStatus int
+
+const (
+	tokenActive tokenStatus = iota
+	tokenInactive
+	tokenUnavailable
+)
+
 type oidcErrKind int
 
 const (

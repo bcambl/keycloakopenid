@@ -17,7 +17,8 @@ spec:
       KeycloakRealm: demo
       Scope: openid profile email
       UseAuthHeader: true
-      IgnorePathPrefixes: /favicon.ico,/healthz
+      CallbackURL: https://{{ vm_host }}{{ client.callback }}
+      IgnorePathPrefixes: {{ helloworld_apps | map(attribute='name') | map('regex_replace', '^(.*)$', '/\\1/favicon.ico,/\\1/healthz') | join(',') }}
 ---
 # A single router (and therefore a single plugin instance and session store)
 # authenticates every app path, then hands the request to Traefik's own
@@ -35,7 +36,7 @@ spec:
     - websecure
   routes:
     - kind: Rule
-      match: {{ helloworld_apps | map(attribute='name') | map('regex_replace', '^(.*)$', 'PathPrefix(`/\\1`)') | join(' || ') }}
+      match: {{ helloworld_apps | map(attribute='name') | map('regex_replace', '^(.*)$', 'PathPrefix(`/\\1`)') | join(' || ') }} || PathPrefix(`/callback`)
       middlewares:
         - name: shared-auth
       services:

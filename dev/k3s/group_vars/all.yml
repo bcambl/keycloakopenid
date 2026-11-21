@@ -15,12 +15,15 @@ keycloak_clients:
   - id: helloworld1
     secret: helloworld1-dev-secret
     paths: [/helloworld1]
+    callback: /helloworld1/callback
   - id: helloworld2
     secret: helloworld2-dev-secret
     paths: [/helloworld2]
+    callback: /helloworld2/callback
   - id: helloworld-shared
     secret: helloworld-shared-dev-secret
     paths: [/helloworld1, /helloworld2]
+    callback: /callback
 helloworld_image: localhost/helloworld:dev
 helloworld_apps:
   - name: helloworld1

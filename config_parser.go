@@ -43,35 +43,23 @@ type Config struct {
 	RefreshBeforeExpiryEnv string `json:"refresh_before_expiry_env"`
 }
 
+// keycloakAuth is the middleware. It owns the validated OIDC client, the shared
+// per-client session and login stores, and the fixed callback used to complete
+// the authorization-code flow.
 type keycloakAuth struct {
 	next                http.Handler
-	KeycloakURL         *url.URL
-	InsecureSkipVerify  bool
-	ClientID            string
-	ClientSecret        string
-	KeycloakRealm       string
-	Scope               string
+	KeycloakURL         *url.URL // resolved base (post legacy /auth probe)
+	issuer              string   // KeycloakURL + /realms/<realm>
+	clientKey           string   // normalized URL + realm + client, for shared stores
+	oidc                *oidcClient
+	loginStore          *loginStore
+	CallbackURL         *url.URL
 	UseAuthHeader       bool
 	UserClaimName       string
 	UserHeaderName      string
 	IgnorePathPrefixes  []string
-	CallbackURL         *url.URL
-	SessionCapacity     int
-	SessionStore        *SessionStore
 	RefreshBeforeExpiry time.Duration
-	upstream            *http.Client
-}
-
-type KeycloakTokenResponse struct {
-	AccessToken      string `json:"access_token"`
-	TokenType        string `json:"token_type"`
-	ExpiresIn        int    `json:"expires_in"`
-	RefreshToken     string `json:"refresh_token"`
-	RefreshExpiresIn int    `json:"refresh_expires_in"`
-}
-
-type state struct {
-	RedirectURL string `json:"redirect_url"`
+	SessionStore        *SessionStore
 }
 
 func CreateConfig() *Config {
@@ -118,8 +106,11 @@ func validateCallbackURL(raw string) (*url.URL, error) {
 	return u, nil
 }
 
+// isLoopbackHost reports whether host resolves to a loopback address. It treats
+// the reserved .localhost TLD, which statically resolves to loopback, the same
+// as the bare localhost name.
 func isLoopbackHost(host string) bool {
-	if host == "localhost" {
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
 		return true
 	}
 	ip := net.ParseIP(host)
@@ -296,12 +287,9 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 		keycloakURL = compatURL
 	}
 
-	var callbackURL *url.URL
-	if config.CallbackURL != "" {
-		callbackURL, err = validateCallbackURL(config.CallbackURL)
-		if err != nil {
-			return nil, err
-		}
+	callbackURL, err := validateCallbackURL(config.CallbackURL)
+	if err != nil {
+		return nil, err
 	}
 
 	sessionCapacity := config.SessionCapacity
@@ -319,11 +307,6 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 		return nil, err
 	}
 
-	useAuthHeader := false
-	if config.UseAuthHeader {
-		useAuthHeader = true
-	}
-
 	userClaimName := "preferred_username"
 	if config.UserClaimName != "" {
 		userClaimName = config.UserClaimName
@@ -339,22 +322,38 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 		return nil, err
 	}
 
+	issuer := keycloakURL.JoinPath("realms", config.KeycloakRealm).String()
+	clientKey := strings.Join([]string{keycloakURL.String(), config.KeycloakRealm, config.ClientID}, "\x00")
+
+	oidcClient, err := newOIDCClient(uctx, runtimeConfig{
+		Issuer:       issuer,
+		ClientID:     config.ClientID,
+		ClientSecret: config.ClientSecret,
+		CallbackURL:  callbackURL.String(),
+		Scope:        scope,
+		Upstream:     upstream,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	sessionStore := sharedSessionStore(clientKey, sessionCapacity)
+	sessionStore.SetCapacity(sessionCapacity)
+	loginStore := sharedLoginStore(clientKey, callbackURL.String())
+
 	return &keycloakAuth{
 		next:                next,
 		KeycloakURL:         keycloakURL,
-		InsecureSkipVerify:  config.InsecureSkipVerify,
-		ClientID:            config.ClientID,
-		ClientSecret:        config.ClientSecret,
-		KeycloakRealm:       config.KeycloakRealm,
-		Scope:               scope,
-		UseAuthHeader:       useAuthHeader,
+		issuer:              issuer,
+		clientKey:           clientKey,
+		oidc:                oidcClient,
+		loginStore:          loginStore,
+		CallbackURL:         callbackURL,
+		UseAuthHeader:       config.UseAuthHeader,
 		UserClaimName:       userClaimName,
 		UserHeaderName:      userHeaderName,
 		IgnorePathPrefixes:  ignorePathPrefixes,
-		CallbackURL:         callbackURL,
-		SessionCapacity:     sessionCapacity,
-		SessionStore:        sharedSessionStore(strings.Join([]string{keycloakURL.String(), config.KeycloakRealm, config.ClientID}, "\x00"), sessionCapacity),
 		RefreshBeforeExpiry: refreshBeforeExpiry,
-		upstream:            upstream,
+		SessionStore:        sessionStore,
 	}, nil
 }

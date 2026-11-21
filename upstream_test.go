@@ -2,6 +2,7 @@ package keycloakopenid
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -178,6 +179,18 @@ func TestNewLegacySupportProbesCompat(t *testing.T) {
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
+
+	// New() now constructs an OIDC client, so the legacy base must also serve a
+	// discovery document for the /auth issuer.
+	issuer := srv.URL + "/auth/realms/r"
+	mux.HandleFunc("/auth/realms/r/.well-known/openid-configuration", func(rw http.ResponseWriter, req *http.Request) {
+		rw.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(rw, `{"issuer":%q,"authorization_endpoint":%q,"token_endpoint":%q,"jwks_uri":%q}`,
+			issuer,
+			issuer+"/protocol/openid-connect/auth",
+			issuer+"/protocol/openid-connect/token",
+			srv.URL+"/jwks")
+	})
 
 	config := testConfig()
 	config.KeycloakURL = srv.URL

@@ -19,7 +19,8 @@ spec:
       KeycloakRealm: demo
       Scope: openid profile email
       UseAuthHeader: true
-      IgnorePathPrefixes: /favicon.ico,/healthz
+      CallbackURL: https://{{ vm_host }}{{ client.callback }}
+      IgnorePathPrefixes: /{{ app.name }}/favicon.ico,/{{ app.name }}/healthz
 ---
 apiVersion: traefik.io/v1alpha1
 kind: Middleware

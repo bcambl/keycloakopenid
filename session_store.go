@@ -45,15 +45,20 @@ func (s *Session) expiredLocked(now time.Time) bool {
 }
 
 // applyTokenSet atomically replaces the session's tokens and expiry from a
-// token set produced by an exchange or refresh. RefreshExpiresIn semantics:
-// nil preserves the previous refresh expiry, 0 clears it (no fixed expiry), and
-// a positive value replaces it. A negative value is invalid and is rejected
-// before a token set is built, so it is never observed here. A non-empty
-// identity subject replaces the stored identity; an empty subject preserves it.
+// token set produced by an exchange or refresh.
 func (s *Session) applyTokenSet(ts *tokenSet) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.applyTokenSetLocked(ts)
+}
 
+// applyTokenSetLocked applies a token set assuming the caller already holds the
+// session lock. RefreshExpiresIn semantics: nil preserves the previous refresh
+// expiry, 0 clears it (no fixed expiry), and a positive value replaces it. A
+// negative value is invalid and is rejected before a token set is built, so it
+// is never observed here. A non-empty identity subject replaces the stored
+// identity; an empty subject preserves it.
+func (s *Session) applyTokenSetLocked(ts *tokenSet) {
 	s.AccessToken = ts.AccessToken
 	if ts.RefreshToken != "" {
 		s.RefreshToken = ts.RefreshToken
