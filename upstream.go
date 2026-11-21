@@ -1,12 +1,10 @@
 package keycloakopenid
 
 import (
-	"context"
 	"crypto/tls"
 	"errors"
 	"io"
 	"net/http"
-	"net/url"
 	"time"
 )
 
@@ -77,36 +75,4 @@ func (l *limitedReadCloser) Read(p []byte) (int, error) {
 
 func (l *limitedReadCloser) Close() error {
 	return l.rc.Close()
-}
-
-// setKeycloakCompatURL probes a couple of well-known endpoints to determine if
-// the current Keycloak instance is the older wildfly or the newer quarkus
-// version and dynamically adds /auth to the URL as required.
-func setKeycloakCompatURL(ctx context.Context, client *http.Client, keycloakURL *url.URL, realm string) (*url.URL, error) {
-	if ok, err := endpointReachable(ctx, client, keycloakURL.JoinPath("realms", realm)); err != nil {
-		return nil, err
-	} else if ok {
-		return keycloakURL, nil
-	}
-
-	if ok, err := endpointReachable(ctx, client, keycloakURL.JoinPath("auth", "realms", realm)); err != nil {
-		return nil, err
-	} else if ok {
-		return keycloakURL.JoinPath("auth"), nil
-	}
-
-	return nil, errors.New("could not determine Keycloak compatibility")
-}
-
-func endpointReachable(ctx context.Context, client *http.Client, target *url.URL) (bool, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
-	if err != nil {
-		return false, err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return false, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	return resp.StatusCode == http.StatusOK, nil
 }

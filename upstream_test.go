@@ -2,11 +2,9 @@ package keycloakopenid
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -151,94 +149,5 @@ func TestNewUpstreamHTTPClientDoesNotMutateDefaultTransport(t *testing.T) {
 	}
 	if client.Transport == http.DefaultTransport {
 		t.Fatal("client must not use DefaultTransport directly")
-	}
-}
-
-func TestSetKeycloakCompatURLModern(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/realms/r", func(rw http.ResponseWriter, req *http.Request) {
-		rw.WriteHeader(http.StatusOK)
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	base, _ := url.Parse(srv.URL)
-	got, err := setKeycloakCompatURL(context.Background(), newUpstreamHTTPClient(false), base, "r")
-	if err != nil {
-		t.Fatalf("setKeycloakCompatURL returned error: %v", err)
-	}
-	if got.String() != base.String() {
-		t.Fatalf("url = %q, want %q (modern quarkus, no /auth)", got, base)
-	}
-}
-
-func TestSetKeycloakCompatURLLegacy(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/realms/r", func(rw http.ResponseWriter, req *http.Request) {
-		rw.WriteHeader(http.StatusNotFound)
-	})
-	mux.HandleFunc("/auth/realms/r", func(rw http.ResponseWriter, req *http.Request) {
-		rw.WriteHeader(http.StatusOK)
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	base, _ := url.Parse(srv.URL)
-	got, err := setKeycloakCompatURL(context.Background(), newUpstreamHTTPClient(false), base, "r")
-	if err != nil {
-		t.Fatalf("setKeycloakCompatURL returned error: %v", err)
-	}
-	want := base.String() + "/auth"
-	if got.String() != want {
-		t.Fatalf("url = %q, want %q (legacy wildfly, with /auth)", got, want)
-	}
-}
-
-func TestSetKeycloakCompatURLUnknown(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/realms/r", func(rw http.ResponseWriter, req *http.Request) {
-		rw.WriteHeader(http.StatusNotFound)
-	})
-	mux.HandleFunc("/auth/realms/r", func(rw http.ResponseWriter, req *http.Request) {
-		rw.WriteHeader(http.StatusNotFound)
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	base, _ := url.Parse(srv.URL)
-	if _, err := setKeycloakCompatURL(context.Background(), newUpstreamHTTPClient(false), base, "r"); err == nil {
-		t.Fatal("expected error when neither endpoint responds OK")
-	}
-}
-
-func TestNewLegacySupportProbesCompat(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/realms/r", func(rw http.ResponseWriter, req *http.Request) {
-		rw.WriteHeader(http.StatusNotFound)
-	})
-	mux.HandleFunc("/auth/realms/r", func(rw http.ResponseWriter, req *http.Request) {
-		rw.WriteHeader(http.StatusOK)
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	// New() now constructs an OIDC client, so the legacy base must also serve a
-	// discovery document for the /auth issuer.
-	issuer := srv.URL + "/auth/realms/r"
-	mux.HandleFunc("/auth/realms/r/.well-known/openid-configuration", func(rw http.ResponseWriter, req *http.Request) {
-		rw.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(rw, `{"issuer":%q,"authorization_endpoint":%q,"token_endpoint":%q,"jwks_uri":%q}`,
-			issuer,
-			issuer+"/protocol/openid-connect/auth",
-			issuer+"/protocol/openid-connect/token",
-			srv.URL+"/jwks")
-	})
-
-	config := testConfig()
-	config.KeycloakURL = srv.URL
-	config.LegacySupport = true
-	auth := newTestAuth(t, config)
-	if !strings.HasSuffix(auth.KeycloakURL.String(), "/auth") {
-		t.Fatalf("KeycloakURL = %q, want /auth suffix for legacy keycloak", auth.KeycloakURL)
 	}
 }

@@ -62,7 +62,7 @@ Or from environment variables:
 | `UserClaimName` | `preferred_username` | ID-token claim forwarded as the user identity. |
 | `UserHeaderName` | `X-Forwarded-User` | Header the user identity is written to. Must be a valid RFC 7230 header field name and must not be `Authorization`. |
 | `IgnorePathPrefixes` | none | Comma-delimited path prefixes that bypass authentication. Matched by path segment, not substring. Trailing slashes are removed, so `/api/` behaves as `/api`. |
-| `LegacySupport` | `false` | Target an older Keycloak instance that serves realms under `/auth`. |
+| `LegacySupport` | `false` | Target an older Keycloak instance that serves realms under `/auth`. When true, the configured base path is statically extended with a final `auth` segment; an existing `/auth` suffix is left unchanged. |
 | `RefreshBeforeExpiry` | `30s` | How close to access-token expiry a session is renewed. Must not be negative. |
 | `InsecureSkipVerify` | `false` | Skip TLS certificate verification of an HTTPS Keycloak connection. Development only; it does not permit plain HTTP. |
 
@@ -96,6 +96,14 @@ Sessions are held in memory, inside the Traefik process. They are keyed by the n
 - A session ends when Keycloak refuses a refresh (`invalid_grant`); navigation is redirected to Keycloak and API requests receive `401`.
 - Introspection failures answer `502` and leave the session intact. A renewal failure for an active token may let the request proceed with its current access token. A renewal outage for an inactive token, where renewal is forced, answers `502`. Neither outcome deletes the stored session.
 
+## Provider discovery
+
+The plugin fetches the realm's OpenID Connect discovery document on first use, not during middleware construction. Startup and dynamic configuration reloads therefore never require Keycloak to be reachable, and a temporarily unavailable provider cannot prevent Traefik from loading the plugin.
+
+Discovery runs once at a time and is cached after success. If it fails, the failure is not cached: a later login or request needing the provider retries discovery. While discovery is unavailable, a navigation request that would start a login receives `502`, and clients can retry later without restarting Traefik.
+
+`LegacySupport` does not probe the provider. When enabled, the plugin statically appends `/auth` to the configured base URL if the final path segment is not already `auth`. Leave it disabled for current Keycloak releases.
+
 ## Authorization is the application's job
 
 This middleware authenticates and identifies the user. It does not authorize. `X-Forwarded-User` is a trusted-proxy convention, not an OpenID Connect standard, and carries no proof of roles or groups. There is no role or group authorization feature. A downstream application must enforce its own authorization and must not trust these headers from any path that bypasses this middleware.
@@ -109,7 +117,7 @@ This middleware authenticates and identifies the user. It does not authorize. `X
 - `SilentRenewal` and the one-hour legacy session are removed. The plugin always renews with the refresh token as described above, and uses 303 redirects, never 307.
 - `IgnorePathPrefixes` now matches by path segment (`/healthz` matches `/healthz` and `/healthz/...`), not by substring. Trailing slashes are removed, and `/` disables authentication for every path on the router.
 - `CallbackURL` is now required and must be registered on the Keycloak client. Existing deployments must add it and update their client redirect URIs.
-- `LegacySupport` no longer changes session behavior; it only probes for an older Keycloak `/auth` prefix. Remove it unless you target such an instance.
+- `LegacySupport` no longer changes session behavior; it statically appends `/auth` to the Keycloak base URL and never probes the provider. Remove it unless you target such an instance.
 
 ## Plugin dependencies
 

@@ -325,6 +325,47 @@ func TestConfigCustomUserHeaderAndClaim(t *testing.T) {
 	}
 }
 
+func TestCatalogStyleConfigInitializesOffline(t *testing.T) {
+	config := CreateConfig()
+	config.KeycloakURL = "my-keycloak-url.com"
+	config.ClientID = "<CLIENT_ID>"
+	config.ClientSecret = "<CLIENT_SECRET>"
+	config.KeycloakRealm = "<REALM>"
+	config.Scope = "openid"
+	config.CallbackURL = "https://app.example.com/callback"
+	config.UseAuthHeader = false
+
+	handler, err := New(context.Background(), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), config, "catalog")
+	if err != nil {
+		t.Fatalf("New returned error without network access: %v", err)
+	}
+	if handler == nil {
+		t.Fatal("New returned nil handler")
+	}
+}
+
+func TestLegacySupportUsesStaticAuthPath(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"adds auth", "https://kc.test", "https://kc.test/auth"},
+		{"keeps auth", "https://kc.test/auth", "https://kc.test/auth"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			config := testConfig()
+			config.KeycloakURL = tc.raw
+			config.LegacySupport = true
+			auth := newTestAuth(t, config)
+			if got := auth.KeycloakURL.String(); got != tc.want {
+				t.Fatalf("KeycloakURL = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestConfigUserHeaderNameValidation(t *testing.T) {
 	valid := []string{"X-Forwarded-User", "x-custom-user", "X_Custom!", "X-123"}
 	for _, name := range valid {

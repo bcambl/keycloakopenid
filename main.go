@@ -142,7 +142,11 @@ func (k *keycloakAuth) startLogin(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	authURL := k.oidc.authCodeURL(state, nonce, pkceChallenge(verifier))
+	authURL, err := k.oidc.authCodeURL(req.Context(), state, nonce, pkceChallenge(verifier))
+	if err != nil {
+		k.writeUnavailable(rw)
+		return
+	}
 
 	http.SetCookie(rw, loginCookie(k.clientKey, state))
 	http.Redirect(rw, req, authURL, http.StatusSeeOther)

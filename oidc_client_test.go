@@ -39,6 +39,9 @@ type oidcTestProvider struct {
 	discoveryStatus     int
 	discoveryAlgorithms []string
 	discoveryBody       string
+	discoveryRequests   int
+	discoveryStarted    chan struct{}
+	discoveryRelease    chan struct{}
 
 	jwksStatus   int
 	jwksBody     string
@@ -98,11 +101,19 @@ func (p *oidcTestProvider) handle(rw http.ResponseWriter, req *http.Request) {
 
 func (p *oidcTestProvider) serveDiscovery(rw http.ResponseWriter) {
 	p.mu.Lock()
+	p.discoveryRequests++
+	requestNumber := p.discoveryRequests
 	status := p.discoveryStatus
 	body := p.discoveryBody
 	algs := p.discoveryAlgorithms
+	started := p.discoveryStarted
+	release := p.discoveryRelease
 	p.mu.Unlock()
 
+	if requestNumber == 1 && started != nil {
+		close(started)
+		<-release
+	}
 	rw.Header().Set("Content-Type", "application/json")
 	if body == "" {
 		doc := map[string]any{
@@ -207,7 +218,7 @@ func (p *oidcTestProvider) baseClaims() map[string]any {
 
 func (p *oidcTestProvider) newClient(t *testing.T) *oidcClient {
 	t.Helper()
-	c, err := newOIDCClient(context.Background(), runtimeConfig{
+	c, err := newOIDCClient(runtimeConfig{
 		Issuer:       p.issuer,
 		ClientID:     p.clientID,
 		ClientSecret: "client-secret",
@@ -218,7 +229,16 @@ func (p *oidcTestProvider) newClient(t *testing.T) *oidcClient {
 	if err != nil {
 		t.Fatalf("newOIDCClient returned error: %v", err)
 	}
+	if err := c.initialize(context.Background()); err != nil {
+		t.Fatalf("initialize returned error: %v", err)
+	}
 	return c
+}
+
+func (p *oidcTestProvider) discoveryRequestCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.discoveryRequests
 }
 
 func (p *oidcTestProvider) setToken(body string) {
@@ -384,7 +404,7 @@ func wantOIDCError(t *testing.T, err error, kind oidcErrKind) {
 
 func TestNewOIDCClientDiscovery(t *testing.T) {
 	p := newOIDCTestProvider(t)
-	c, err := newOIDCClient(context.Background(), runtimeConfig{
+	c, err := newOIDCClient(runtimeConfig{
 		Issuer:       p.issuer,
 		ClientID:     p.clientID,
 		ClientSecret: "client-secret",
@@ -395,6 +415,98 @@ func TestNewOIDCClientDiscovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newOIDCClient returned error: %v", err)
 	}
+	if err := c.initialize(context.Background()); err != nil {
+		t.Fatalf("initialize returned error: %v", err)
+	}
+	if c.introspectionURL != p.issuer+"/protocol/openid-connect/token/introspect" {
+		t.Fatalf("introspectionURL = %q, want %q", c.introspectionURL, p.issuer+"/protocol/openid-connect/token/introspect")
+	}
+}
+
+func TestOIDCClientDiscoveryRetries(t *testing.T) {
+	p := newOIDCTestProvider(t)
+	c, err := newOIDCClient(runtimeConfig{
+		Issuer:       p.issuer,
+		ClientID:     p.clientID,
+		ClientSecret: "client-secret",
+		CallbackURL:  "https://app.test/callback",
+		Scope:        "openid",
+		Upstream:     newUpstreamHTTPClient(false),
+	})
+	if err != nil {
+		t.Fatalf("newOIDCClient returned error: %v", err)
+	}
+
+	p.mu.Lock()
+	p.discoveryStatus = http.StatusInternalServerError
+	p.mu.Unlock()
+	if err := c.initialize(context.Background()); err == nil {
+		t.Fatal("initialize returned nil error, want discovery outage")
+	} else {
+		wantOIDCError(t, err, oidcErrOutage)
+	}
+	if c.introspectionURL != "" {
+		t.Fatalf("introspectionURL = %q after failed discovery, want empty", c.introspectionURL)
+	}
+
+	p.mu.Lock()
+	p.discoveryStatus = http.StatusOK
+	p.mu.Unlock()
+	if err := c.initialize(context.Background()); err != nil {
+		t.Fatalf("second initialize returned error: %v", err)
+	}
+	if c.introspectionURL != p.issuer+"/protocol/openid-connect/token/introspect" {
+		t.Fatalf("introspectionURL = %q, want %q", c.introspectionURL, p.issuer+"/protocol/openid-connect/token/introspect")
+	}
+	if got := p.discoveryRequestCount(); got != 2 {
+		t.Fatalf("discovery requests = %d, want 2", got)
+	}
+}
+
+func TestOIDCClientConcurrentInitialization(t *testing.T) {
+	p := newOIDCTestProvider(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	p.mu.Lock()
+	p.discoveryStarted = started
+	p.discoveryRelease = release
+	p.mu.Unlock()
+
+	c, err := newOIDCClient(runtimeConfig{
+		Issuer:       p.issuer,
+		ClientID:     p.clientID,
+		ClientSecret: "client-secret",
+		CallbackURL:  "https://app.test/callback",
+		Scope:        "openid",
+		Upstream:     newUpstreamHTTPClient(false),
+	})
+	if err != nil {
+		t.Fatalf("newOIDCClient returned error: %v", err)
+	}
+
+	const workers = 32
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- c.initialize(context.Background())
+		}()
+	}
+	<-started
+	close(release)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("initialize returned error: %v", err)
+		}
+	}
+	if got := p.discoveryRequestCount(); got != 1 {
+		t.Fatalf("discovery requests = %d, want exactly 1", got)
+	}
 	if c.introspectionURL != p.issuer+"/protocol/openid-connect/token/introspect" {
 		t.Fatalf("introspectionURL = %q, want %q", c.introspectionURL, p.issuer+"/protocol/openid-connect/token/introspect")
 	}
@@ -403,7 +515,7 @@ func TestNewOIDCClientDiscovery(t *testing.T) {
 func TestNewOIDCClientRejectsNoAsymmetricAlgorithm(t *testing.T) {
 	p := newOIDCTestProvider(t)
 	p.discoveryAlgorithms = []string{"HS256"}
-	_, err := newOIDCClient(context.Background(), runtimeConfig{
+	c, err := newOIDCClient(runtimeConfig{
 		Issuer:       p.issuer,
 		ClientID:     p.clientID,
 		ClientSecret: "client-secret",
@@ -411,6 +523,10 @@ func TestNewOIDCClientRejectsNoAsymmetricAlgorithm(t *testing.T) {
 		Scope:        "openid",
 		Upstream:     newUpstreamHTTPClient(false),
 	})
+	if err != nil {
+		t.Fatalf("newOIDCClient returned error: %v", err)
+	}
+	err = c.initialize(context.Background())
 	wantOIDCError(t, err, oidcErrMalformed)
 }
 
@@ -418,7 +534,7 @@ func TestNewOIDCClientDiscoveryOutage(t *testing.T) {
 	p := newOIDCTestProvider(t)
 	p.discoveryStatus = http.StatusInternalServerError
 	p.discoveryBody = `{"error":"SECRET_LEAK_MARKER"}`
-	_, err := newOIDCClient(context.Background(), runtimeConfig{
+	c, err := newOIDCClient(runtimeConfig{
 		Issuer:       p.issuer,
 		ClientID:     p.clientID,
 		ClientSecret: "client-secret",
@@ -426,6 +542,10 @@ func TestNewOIDCClientDiscoveryOutage(t *testing.T) {
 		Scope:        "openid",
 		Upstream:     newUpstreamHTTPClient(false),
 	})
+	if err != nil {
+		t.Fatalf("newOIDCClient returned error: %v", err)
+	}
+	err = c.initialize(context.Background())
 	wantOIDCError(t, err, oidcErrOutage)
 	for _, want := range []string{`path "/realms/r/.well-known/openid-configuration"`, "status 500"} {
 		if !strings.Contains(err.Error(), want) {
@@ -442,7 +562,7 @@ func TestNewOIDCClientDiscoveryOutage(t *testing.T) {
 func TestNewOIDCClientMalformedDiscovery(t *testing.T) {
 	p := newOIDCTestProvider(t)
 	p.discoveryBody = `{"not":"json"` + "\n" + `}`
-	_, err := newOIDCClient(context.Background(), runtimeConfig{
+	c, err := newOIDCClient(runtimeConfig{
 		Issuer:       p.issuer,
 		ClientID:     p.clientID,
 		ClientSecret: "client-secret",
@@ -450,6 +570,10 @@ func TestNewOIDCClientMalformedDiscovery(t *testing.T) {
 		Scope:        "openid",
 		Upstream:     newUpstreamHTTPClient(false),
 	})
+	if err != nil {
+		t.Fatalf("newOIDCClient returned error: %v", err)
+	}
+	err = c.initialize(context.Background())
 	wantOIDCError(t, err, oidcErrMalformed)
 }
 
@@ -461,7 +585,7 @@ func TestNewOIDCClientIssuerMismatch(t *testing.T) {
 		"token_endpoint":         p.issuer + "/protocol/openid-connect/token",
 		"jwks_uri":               p.srv.URL + "/jwks",
 	})
-	_, err := newOIDCClient(context.Background(), runtimeConfig{
+	c, err := newOIDCClient(runtimeConfig{
 		Issuer:       p.issuer,
 		ClientID:     p.clientID,
 		ClientSecret: "client-secret",
@@ -469,6 +593,10 @@ func TestNewOIDCClientIssuerMismatch(t *testing.T) {
 		Scope:        "openid",
 		Upstream:     newUpstreamHTTPClient(false),
 	})
+	if err != nil {
+		t.Fatalf("newOIDCClient returned error: %v", err)
+	}
+	err = c.initialize(context.Background())
 	wantOIDCError(t, err, oidcErrMalformed)
 }
 
@@ -511,7 +639,7 @@ func TestNewOIDCClientRejectsInvalidProviderURLs(t *testing.T) {
 			doc[tc.field] = tc.value
 			p.discoveryBody = mustJSON(doc)
 
-			_, err := newOIDCClient(context.Background(), runtimeConfig{
+			c, err := newOIDCClient(runtimeConfig{
 				Issuer:       p.issuer,
 				ClientID:     p.clientID,
 				ClientSecret: "client-secret",
@@ -519,6 +647,10 @@ func TestNewOIDCClientRejectsInvalidProviderURLs(t *testing.T) {
 				Scope:        "openid",
 				Upstream:     newUpstreamHTTPClient(false),
 			})
+			if err != nil {
+				t.Fatalf("newOIDCClient returned error: %v", err)
+			}
+			err = c.initialize(context.Background())
 			wantOIDCError(t, err, oidcErrMalformed)
 		})
 	}
@@ -577,7 +709,7 @@ func TestNewOIDCClientDiscoveryExceedsLocalLimit(t *testing.T) {
 	// A discovery body over 1 MiB must be rejected even when the upstream
 	// client does not bound the body itself, proving the local limit.
 	p.discoveryBody = strings.Repeat("x", (1<<20)+1)
-	_, err := newOIDCClient(context.Background(), runtimeConfig{
+	c, err := newOIDCClient(runtimeConfig{
 		Issuer:       p.issuer,
 		ClientID:     p.clientID,
 		ClientSecret: "client-secret",
@@ -585,6 +717,10 @@ func TestNewOIDCClientDiscoveryExceedsLocalLimit(t *testing.T) {
 		Scope:        "openid",
 		Upstream:     &http.Client{},
 	})
+	if err != nil {
+		t.Fatalf("newOIDCClient returned error: %v", err)
+	}
+	err = c.initialize(context.Background())
 	wantOIDCError(t, err, oidcErrMalformed)
 }
 
@@ -620,7 +756,10 @@ func TestAuthCodeURLContainsExactCallbackS256AndNonce(t *testing.T) {
 	p := newOIDCTestProvider(t)
 	c := p.newClient(t)
 
-	raw := c.authCodeURL("st4te", "n0nce", "ch4llenge")
+	raw, err := c.authCodeURL(context.Background(), "st4te", "n0nce", "ch4llenge")
+	if err != nil {
+		t.Fatalf("authCodeURL returned error: %v", err)
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		t.Fatalf("authCodeURL returned unparseable URL %q: %v", raw, err)

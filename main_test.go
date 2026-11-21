@@ -221,6 +221,31 @@ func TestRootAndTrailingSlashIgnorePathMatching(t *testing.T) {
 	}
 }
 
+func TestLoginDiscoveryOutageThenRecovery(t *testing.T) {
+	p := newOIDCTestProvider(t)
+	auth := newAuth(t, p, nil)
+
+	p.mu.Lock()
+	p.discoveryStatus = http.StatusInternalServerError
+	p.mu.Unlock()
+
+	rw := httptest.NewRecorder()
+	auth.ServeHTTP(rw, navigationGet("https://app.test/dashboard"))
+	if rw.Code != http.StatusBadGateway {
+		t.Fatalf("status during discovery outage = %d, want 502", rw.Code)
+	}
+
+	p.mu.Lock()
+	p.discoveryStatus = http.StatusOK
+	p.mu.Unlock()
+
+	rw = httptest.NewRecorder()
+	auth.ServeHTTP(rw, navigationGet("https://app.test/dashboard"))
+	if rw.Code != http.StatusSeeOther {
+		t.Fatalf("status after discovery recovery = %d, want 303", rw.Code)
+	}
+}
+
 func TestIsNavigationRequestTable(t *testing.T) {
 	cases := []struct {
 		name      string

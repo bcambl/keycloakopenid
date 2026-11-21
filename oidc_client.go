@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -31,8 +32,12 @@ type runtimeConfig struct {
 }
 
 // oidcClient is a standalone OpenID Connect client backed by provider
-// discovery and cached JWKS verification.
+// discovery and cached JWKS verification. Discovery happens on first use so
+// construction never depends on the provider being reachable.
 type oidcClient struct {
+	cfg              runtimeConfig
+	mu               sync.Mutex
+	ready            bool
 	clientID         string
 	clientSecret     string
 	oauth            *oauth2.Config
@@ -111,7 +116,7 @@ func isOIDCRefusal(err error) bool {
 	return errors.As(err, &oe) && oe.kind == oidcErrRefusal
 }
 
-func newOIDCClient(ctx context.Context, cfg runtimeConfig) (*oidcClient, error) {
+func newOIDCClient(cfg runtimeConfig) (*oidcClient, error) {
 	if cfg.Issuer == "" {
 		return nil, errors.New("oidc: issuer is required")
 	}
@@ -122,44 +127,61 @@ func newOIDCClient(ctx context.Context, cfg runtimeConfig) (*oidcClient, error) 
 		return nil, errors.New("oidc: upstream client is required")
 	}
 
-	provider, err := discoverProvider(ctx, cfg)
+	return &oidcClient{
+		cfg:          cfg,
+		clientID:     cfg.ClientID,
+		clientSecret: cfg.ClientSecret,
+		upstream:     cfg.Upstream,
+	}, nil
+}
+
+// initialize discovers the provider once and publishes the derived OAuth
+// configuration, JWT parser, JWKS cache, and introspection endpoint. Calls are
+// serialized across discovery so concurrent callers cannot duplicate requests
+// or observe partially initialized state. A failure leaves the client unready
+// so a later call retries.
+func (c *oidcClient) initialize(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.ready {
+		return nil
+	}
+
+	provider, err := discoverProvider(ctx, c.cfg)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	algs, err := signingAlgorithms(provider.algorithms)
 	if err != nil {
-		return nil, newOIDCError(oidcErrMalformed, err)
+		return newOIDCError(oidcErrMalformed, err)
 	}
 
-	oauth := &oauth2.Config{
-		ClientID:     cfg.ClientID,
-		ClientSecret: cfg.ClientSecret,
-		RedirectURL:  cfg.CallbackURL,
+	oauthConfig := &oauth2.Config{
+		ClientID:     c.cfg.ClientID,
+		ClientSecret: c.cfg.ClientSecret,
+		RedirectURL:  c.cfg.CallbackURL,
 		Endpoint: oauth2.Endpoint{
 			AuthURL:   provider.authURL,
 			TokenURL:  provider.tokenURL,
 			AuthStyle: oauth2.AuthStyleInParams,
 		},
-		Scopes: oauthScopes(cfg.Scope),
+		Scopes: oauthScopes(c.cfg.Scope),
 	}
 	parser := jwt.NewParser(
 		jwt.WithValidMethods(algs),
-		jwt.WithIssuer(cfg.Issuer),
-		jwt.WithAudience(cfg.ClientID),
+		jwt.WithIssuer(c.cfg.Issuer),
+		jwt.WithAudience(c.cfg.ClientID),
 		jwt.WithExpirationRequired(),
 		jwt.WithIssuedAt(),
 		jwt.WithLeeway(time.Minute),
 	)
 
-	return &oidcClient{
-		clientID:         cfg.ClientID,
-		clientSecret:     cfg.ClientSecret,
-		oauth:            oauth,
-		parser:           parser,
-		jwks:             &jwksCache{client: cfg.Upstream, url: provider.jwksURL},
-		introspectionURL: provider.introspectionURL,
-		upstream:         cfg.Upstream,
-	}, nil
+	c.oauth = oauthConfig
+	c.parser = parser
+	c.jwks = &jwksCache{client: c.cfg.Upstream, url: provider.jwksURL}
+	c.introspectionURL = provider.introspectionURL
+	c.ready = true
+	return nil
 }
 
 type providerMetadata struct {
@@ -295,15 +317,21 @@ func (c *oidcClient) withClient(ctx context.Context) context.Context {
 	return context.WithValue(ctx, oauth2.HTTPClient, c.upstream)
 }
 
-func (c *oidcClient) authCodeURL(state, nonce, codeChallenge string) string {
+func (c *oidcClient) authCodeURL(ctx context.Context, state, nonce, codeChallenge string) (string, error) {
+	if err := c.initialize(ctx); err != nil {
+		return "", err
+	}
 	return c.oauth.AuthCodeURL(state,
 		oauth2.SetAuthURLParam("nonce", nonce),
 		oauth2.SetAuthURLParam("code_challenge", codeChallenge),
 		oauth2.SetAuthURLParam("code_challenge_method", "S256"),
-	)
+	), nil
 }
 
 func (c *oidcClient) exchange(ctx context.Context, code, verifier, nonce string) (*tokenSet, error) {
+	if err := c.initialize(ctx); err != nil {
+		return nil, err
+	}
 	tok, err := c.oauth.Exchange(c.withClient(ctx), code, oauth2.VerifierOption(verifier))
 	if err != nil {
 		return nil, sanitizeOAuthErr(err)
@@ -328,6 +356,9 @@ func (c *oidcClient) exchange(ctx context.Context, code, verifier, nonce string)
 }
 
 func (c *oidcClient) refresh(ctx context.Context, refreshToken string) (*tokenSet, error) {
+	if err := c.initialize(ctx); err != nil {
+		return nil, err
+	}
 	tok, err := c.oauth.TokenSource(c.withClient(ctx), &oauth2.Token{RefreshToken: refreshToken}).Token()
 	if err != nil {
 		return nil, sanitizeOAuthErr(err)
@@ -531,6 +562,9 @@ func sanitizeOAuthErr(err error) error {
 }
 
 func (c *oidcClient) introspect(ctx context.Context, accessToken string) (tokenStatus, error) {
+	if err := c.initialize(ctx); err != nil {
+		return tokenUnavailable, err
+	}
 	form := url.Values{
 		"token":         {accessToken},
 		"client_id":     {c.clientID},

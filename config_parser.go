@@ -49,7 +49,7 @@ type Config struct {
 // the authorization-code flow.
 type keycloakAuth struct {
 	next                http.Handler
-	KeycloakURL         *url.URL // resolved base (post legacy /auth probe)
+	KeycloakURL         *url.URL // resolved base (after static legacy /auth selection)
 	issuer              string   // KeycloakURL + /realms/<realm>
 	clientKey           string   // normalized URL + realm + client, for shared stores
 	oidc                *oidcClient
@@ -364,12 +364,8 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 	upstream := newUpstreamHTTPClient(config.InsecureSkipVerify)
 
 	keycloakURL := parsedURL
-	if config.LegacySupport {
-		compatURL, err := setKeycloakCompatURL(uctx, upstream, parsedURL, config.KeycloakRealm)
-		if err != nil {
-			return nil, err
-		}
-		keycloakURL = compatURL
+	if config.LegacySupport && path.Base(parsedURL.Path) != "auth" {
+		keycloakURL = parsedURL.JoinPath("auth")
 	}
 
 	callbackURL, err := validateCallbackURL(config.CallbackURL)
@@ -416,7 +412,7 @@ func New(uctx context.Context, next http.Handler, config *Config, name string) (
 	issuer := keycloakURL.JoinPath("realms", config.KeycloakRealm).String()
 	clientKey := strings.Join([]string{canonicalKeycloakURL(keycloakURL), config.KeycloakRealm, config.ClientID}, "\x00")
 
-	oidcClient, err := newOIDCClient(uctx, runtimeConfig{
+	oidcClient, err := newOIDCClient(runtimeConfig{
 		Issuer:       issuer,
 		ClientID:     config.ClientID,
 		ClientSecret: config.ClientSecret,
