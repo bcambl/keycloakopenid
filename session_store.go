@@ -86,6 +86,27 @@ var (
 // sessions in the background.
 const sessionCleanupInterval = time.Minute
 
+var (
+	sharedLoginStoresMu sync.Mutex
+	sharedLoginStores   = map[string]*loginStore{}
+)
+
+// sharedLoginStore returns the process-wide pending-login store for one
+// Keycloak client, creating it with the fixed per-client capacity on first use.
+// As with sessions, pending logins must survive middleware-instance recreation
+// on configuration reload, so they are shared across instances.
+func sharedLoginStore(key, callbackURI string) *loginStore {
+	sharedLoginStoresMu.Lock()
+	defer sharedLoginStoresMu.Unlock()
+	store, ok := sharedLoginStores[key]
+	if !ok {
+		store = newLoginStore(callbackURI, loginCapacity)
+		sharedLoginStores[key] = store
+	}
+	store.startCleanup()
+	return store
+}
+
 // sharedSessionStore returns the process-wide store for one Keycloak client,
 // creating it with the given capacity on first use. Traefik creates a
 // middleware instance per router and recreates every instance on each
