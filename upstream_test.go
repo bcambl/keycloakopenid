@@ -34,9 +34,9 @@ func TestNewUpstreamHTTPClientUsesExplicitTransport(t *testing.T) {
 	if !ok {
 		t.Fatalf("Transport = %T, want *boundedRoundTripper", client.Transport)
 	}
-	transport, ok := bounded.base.(*http.Transport)
-	if !ok {
-		t.Fatalf("base transport = %T, want *http.Transport", bounded.base)
+	transport := bounded.base
+	if transport == nil {
+		t.Fatal("base transport is nil")
 	}
 	if transport.Proxy == nil {
 		t.Fatal("Proxy is nil, want environment proxy support")

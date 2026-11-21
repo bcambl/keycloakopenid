@@ -21,26 +21,27 @@ var errResponseTooLarge = errors.New("upstream response exceeds 1 MiB limit")
 // bounded by a 10-second timeout, redirects are refused, and response bodies
 // are capped at 1 MiB.
 func newUpstreamHTTPClient(insecureSkipVerify bool) *http.Client {
-	base := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: time.Second,
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: insecureSkipVerify},
-	}
-	return &http.Client{
-		Transport: &boundedRoundTripper{base: base},
-		Timeout:   upstreamTimeout,
+	base := new(http.Transport)
+	base.Proxy = http.ProxyFromEnvironment
+	base.ForceAttemptHTTP2 = true
+	base.MaxIdleConns = 100
+	base.IdleConnTimeout = 90 * time.Second
+	base.TLSHandshakeTimeout = 10 * time.Second
+	base.ExpectContinueTimeout = time.Second
+	base.TLSClientConfig = &tls.Config{InsecureSkipVerify: insecureSkipVerify}
+
+	client := &http.Client{
+		Timeout: upstreamTimeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
+	client.Transport = &boundedRoundTripper{base: base}
+	return client
 }
 
 type boundedRoundTripper struct {
-	base http.RoundTripper
+	base *http.Transport
 }
 
 func (b *boundedRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
