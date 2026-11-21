@@ -3,6 +3,9 @@ package keycloakopenid
 import (
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
@@ -37,6 +40,10 @@ type oidcTestProvider struct {
 	discoveryAlgorithms []string
 	discoveryBody       string
 
+	jwksStatus   int
+	jwksBody     string
+	jwksRequests int
+
 	tokenStatus int
 	tokenBody   string
 	tokenForm   url.Values
@@ -57,6 +64,7 @@ func newOIDCTestProvider(t *testing.T) *oidcTestProvider {
 		kid:                 "test-key-1",
 		discoveryStatus:     http.StatusOK,
 		discoveryAlgorithms: []string{"RS256"},
+		jwksStatus:          http.StatusOK,
 		tokenStatus:         http.StatusOK,
 		introspectStatus:    http.StatusOK,
 	}
@@ -105,11 +113,19 @@ func (p *oidcTestProvider) serveDiscovery(rw http.ResponseWriter) {
 }
 
 func (p *oidcTestProvider) serveJWKS(rw http.ResponseWriter) {
-	n := base64.RawURLEncoding.EncodeToString(p.key.N.Bytes())
-	e := base64.RawURLEncoding.EncodeToString(big.NewInt(int64(p.key.E)).Bytes())
+	p.mu.Lock()
+	p.jwksRequests++
+	status := p.jwksStatus
+	body := p.jwksBody
+	p.mu.Unlock()
+	if body == "" {
+		n := base64.RawURLEncoding.EncodeToString(p.key.N.Bytes())
+		e := base64.RawURLEncoding.EncodeToString(big.NewInt(int64(p.key.E)).Bytes())
+		body = fmt.Sprintf(`{"keys":[{"kty":"RSA","kid":%q,"alg":"RS256","use":"sig","n":%q,"e":%q}]}`, p.kid, n, e)
+	}
 	rw.Header().Set("Content-Type", "application/json")
-	rw.WriteHeader(http.StatusOK)
-	_, _ = fmt.Fprintf(rw, `{"keys":[{"kty":"RSA","kid":%q,"alg":"RS256","use":"sig","n":%q,"e":%q}]}`, p.kid, n, e)
+	rw.WriteHeader(status)
+	_, _ = rw.Write([]byte(body))
 }
 
 func (p *oidcTestProvider) serveToken(rw http.ResponseWriter, req *http.Request) {
@@ -183,6 +199,18 @@ func (p *oidcTestProvider) setToken(body string) {
 	p.tokenBody = body
 }
 
+func (p *oidcTestProvider) setJWKS(body string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.jwksBody = body
+}
+
+func (p *oidcTestProvider) jwksRequestCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.jwksRequests
+}
+
 func (p *oidcTestProvider) capturedForm() url.Values {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -192,6 +220,100 @@ func (p *oidcTestProvider) capturedForm() url.Values {
 func computeAtHash(accessToken string) string {
 	sum := sha256.Sum256([]byte(accessToken))
 	return base64.RawURLEncoding.EncodeToString(sum[:16])
+}
+
+func hashForAlgorithm(t *testing.T, alg string) crypto.Hash {
+	t.Helper()
+	var h crypto.Hash
+	switch alg {
+	case "RS256", "PS256", "ES256":
+		h = crypto.SHA256
+	case "RS384", "PS384", "ES384":
+		h = crypto.SHA384
+	case "RS512", "PS512", "ES512", "EdDSA":
+		h = crypto.SHA512
+	default:
+		t.Fatalf("unsupported test signing algorithm %q", alg)
+	}
+	return h
+}
+
+func computeAtHashForAlgorithm(t *testing.T, accessToken, alg string) string {
+	t.Helper()
+	h := hashForAlgorithm(t, alg).New()
+	_, _ = h.Write([]byte(accessToken))
+	return base64.RawURLEncoding.EncodeToString(h.Sum(nil)[:h.Size()/2])
+}
+
+func signIDTokenWithAlgorithm(t *testing.T, alg, kid string, key any, claims map[string]any) string {
+	t.Helper()
+	enc := base64.RawURLEncoding
+	header := mustJSON(map[string]any{"alg": alg, "typ": "JWT", "kid": kid})
+	payload := mustJSON(claims)
+	signingInput := enc.EncodeToString([]byte(header)) + "." + enc.EncodeToString([]byte(payload))
+
+	var sig []byte
+	var err error
+	switch alg {
+	case "EdDSA":
+		sig = ed25519.Sign(key.(ed25519.PrivateKey), []byte(signingInput))
+	case "ES256", "ES384", "ES512":
+		ecKey := key.(*ecdsa.PrivateKey)
+		h := hashForAlgorithm(t, alg).New()
+		_, _ = h.Write([]byte(signingInput))
+		var r, s *big.Int
+		r, s, err = ecdsa.Sign(rand.Reader, ecKey, h.Sum(nil))
+		if err != nil {
+			t.Fatalf("ecdsa.Sign returned error: %v", err)
+		}
+		size := (ecKey.Curve.Params().BitSize + 7) / 8
+		sig = make([]byte, 2*size)
+		r.FillBytes(sig[:size])
+		s.FillBytes(sig[size:])
+	default:
+		rsaKey := key.(*rsa.PrivateKey)
+		hash := hashForAlgorithm(t, alg)
+		h := hash.New()
+		_, _ = h.Write([]byte(signingInput))
+		digest := h.Sum(nil)
+		if alg[0:2] == "PS" {
+			sig, err = rsa.SignPSS(rand.Reader, rsaKey, hash, digest, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: hash})
+		} else {
+			sig, err = rsa.SignPKCS1v15(rand.Reader, rsaKey, hash, digest)
+		}
+	}
+	if err != nil {
+		t.Fatalf("signing ID token with %s returned error: %v", alg, err)
+	}
+	return signingInput + "." + enc.EncodeToString(sig)
+}
+
+func publicJWK(t *testing.T, alg, kid string, key any) map[string]any {
+	t.Helper()
+	jwk := map[string]any{"alg": alg, "kid": kid, "use": "sig"}
+	switch k := key.(type) {
+	case *rsa.PrivateKey:
+		jwk["kty"] = "RSA"
+		jwk["n"] = base64.RawURLEncoding.EncodeToString(k.N.Bytes())
+		jwk["e"] = base64.RawURLEncoding.EncodeToString(big.NewInt(int64(k.E)).Bytes())
+	case *ecdsa.PrivateKey:
+		size := (k.Curve.Params().BitSize + 7) / 8
+		x := make([]byte, size)
+		y := make([]byte, size)
+		k.X.FillBytes(x)
+		k.Y.FillBytes(y)
+		jwk["kty"] = "EC"
+		jwk["crv"] = k.Curve.Params().Name
+		jwk["x"] = base64.RawURLEncoding.EncodeToString(x)
+		jwk["y"] = base64.RawURLEncoding.EncodeToString(y)
+	case ed25519.PrivateKey:
+		jwk["kty"] = "OKP"
+		jwk["crv"] = "Ed25519"
+		jwk["x"] = base64.RawURLEncoding.EncodeToString(k.Public().(ed25519.PublicKey))
+	default:
+		t.Fatalf("unsupported test key type %T", key)
+	}
+	return jwk
 }
 
 func marshalTokenResponse(access, refresh, idToken string, expiresIn int, refreshExp *int) string {
@@ -303,6 +425,45 @@ func TestNewOIDCClientIssuerMismatch(t *testing.T) {
 		Upstream:     newUpstreamHTTPClient(false),
 	})
 	wantOIDCError(t, err, oidcErrMalformed)
+}
+
+func TestNewOIDCClientRejectsInvalidProviderURLs(t *testing.T) {
+	cases := []struct {
+		name  string
+		field string
+		value string
+	}{
+		{"relative authorization endpoint", "authorization_endpoint", "/authorize"},
+		{"non-HTTP authorization endpoint", "authorization_endpoint", "file:///authorize"},
+		{"relative token endpoint", "token_endpoint", "/token"},
+		{"non-HTTP token endpoint", "token_endpoint", "ftp://provider.test/token"},
+		{"relative JWKS endpoint", "jwks_uri", "/jwks"},
+		{"non-HTTP JWKS endpoint", "jwks_uri", "javascript:alert(1)"},
+		{"endpoint without host", "jwks_uri", "https:///jwks"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newOIDCTestProvider(t)
+			doc := map[string]any{
+				"issuer":                 p.issuer,
+				"authorization_endpoint": p.issuer + "/protocol/openid-connect/auth",
+				"token_endpoint":         p.issuer + "/protocol/openid-connect/token",
+				"jwks_uri":               p.srv.URL + "/jwks",
+			}
+			doc[tc.field] = tc.value
+			p.discoveryBody = mustJSON(doc)
+
+			_, err := newOIDCClient(context.Background(), runtimeConfig{
+				Issuer:       p.issuer,
+				ClientID:     p.clientID,
+				ClientSecret: "client-secret",
+				CallbackURL:  "https://app.test/callback",
+				Scope:        "openid",
+				Upstream:     newUpstreamHTTPClient(false),
+			})
+			wantOIDCError(t, err, oidcErrMalformed)
+		})
+	}
 }
 
 func TestNewOIDCClientDiscoveryExceedsLocalLimit(t *testing.T) {
@@ -418,6 +579,76 @@ func TestExchangeValidIDToken(t *testing.T) {
 	}
 	if got := ts.Identity.Claims["preferred_username"]; got != "alice" {
 		t.Fatalf("preferred_username = %v, want alice", got)
+	}
+}
+
+func TestExchangeSupportsAsymmetricAlgorithms(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey returned error: %v", err)
+	}
+	cases := []struct {
+		alg    string
+		newKey func(*testing.T) any
+	}{
+		{"RS256", func(*testing.T) any { return rsaKey }},
+		{"RS384", func(*testing.T) any { return rsaKey }},
+		{"RS512", func(*testing.T) any { return rsaKey }},
+		{"PS256", func(*testing.T) any { return rsaKey }},
+		{"PS384", func(*testing.T) any { return rsaKey }},
+		{"PS512", func(*testing.T) any { return rsaKey }},
+		{"ES256", func(t *testing.T) any {
+			key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+			if err != nil {
+				t.Fatalf("ecdsa.GenerateKey returned error: %v", err)
+			}
+			return key
+		}},
+		{"ES384", func(t *testing.T) any {
+			key, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+			if err != nil {
+				t.Fatalf("ecdsa.GenerateKey returned error: %v", err)
+			}
+			return key
+		}},
+		{"ES512", func(t *testing.T) any {
+			key, err := ecdsa.GenerateKey(elliptic.P521(), rand.Reader)
+			if err != nil {
+				t.Fatalf("ecdsa.GenerateKey returned error: %v", err)
+			}
+			return key
+		}},
+		{"EdDSA", func(t *testing.T) any {
+			_, key, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatalf("ed25519.GenerateKey returned error: %v", err)
+			}
+			return key
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.alg, func(t *testing.T) {
+			p := newOIDCTestProvider(t)
+			p.discoveryAlgorithms = []string{tc.alg}
+			key := tc.newKey(t)
+			p.setJWKS(mustJSON(map[string]any{"keys": []any{publicJWK(t, tc.alg, p.kid, key)}}))
+			c := p.newClient(t)
+
+			access := "access-token"
+			claims := p.baseClaims()
+			claims["nonce"] = "n0nce"
+			claims["at_hash"] = computeAtHashForAlgorithm(t, access, tc.alg)
+			idToken := signIDTokenWithAlgorithm(t, tc.alg, p.kid, key, claims)
+			p.setToken(marshalTokenResponse(access, "refresh", idToken, 300, nil))
+
+			ts, err := c.exchange(context.Background(), "code", "verifier", "n0nce")
+			if err != nil {
+				t.Fatalf("exchange returned error for %s: %v", tc.alg, err)
+			}
+			if ts.Identity.Subject != "user-123" {
+				t.Fatalf("Identity.Subject = %q, want user-123", ts.Identity.Subject)
+			}
+		})
 	}
 }
 
@@ -565,6 +796,33 @@ func TestExchangeAcceptsMultipleAudienceWithValidAuthorizedParty(t *testing.T) {
 	}
 }
 
+func TestExchangeRejectsInvalidAuthorizedParty(t *testing.T) {
+	cases := []struct {
+		name string
+		aud  any
+		azp  any
+	}{
+		{"single audience mismatch", "client-id", "other-client"},
+		{"single audience non-string", "client-id", 123},
+		{"multiple audiences mismatch", []string{"client-id", "other-audience"}, "other-client"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newOIDCTestProvider(t)
+			c := p.newClient(t)
+
+			claims := p.baseClaims()
+			claims["aud"] = tc.aud
+			claims["azp"] = tc.azp
+			claims["nonce"] = "n0nce"
+			p.setToken(marshalTokenResponse("access", "refresh", p.signIDToken(claims), 300, nil))
+
+			_, err := c.exchange(context.Background(), "code", "verifier", "n0nce")
+			wantOIDCError(t, err, oidcErrMalformed)
+		})
+	}
+}
+
 func TestExchangeRejectsExpiredIDToken(t *testing.T) {
 	p := newOIDCTestProvider(t)
 	c := p.newClient(t)
@@ -576,6 +834,64 @@ func TestExchangeRejectsExpiredIDToken(t *testing.T) {
 
 	_, err := c.exchange(context.Background(), "code", "verifier", "n0nce")
 	wantOIDCError(t, err, oidcErrMalformed)
+}
+
+func TestExchangeRejectsMissingSubject(t *testing.T) {
+	p := newOIDCTestProvider(t)
+	c := p.newClient(t)
+
+	claims := p.baseClaims()
+	delete(claims, "sub")
+	claims["nonce"] = "n0nce"
+	p.setToken(marshalTokenResponse("access", "refresh", p.signIDToken(claims), 300, nil))
+
+	_, err := c.exchange(context.Background(), "code", "verifier", "n0nce")
+	wantOIDCError(t, err, oidcErrMalformed)
+}
+
+func TestExchangeRejectsInvalidTimeClaims(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{"missing expiry", func(claims map[string]any) { delete(claims, "exp") }},
+		{"not before beyond skew", func(claims map[string]any) {
+			claims["nbf"] = time.Now().Add(2 * time.Minute).Unix()
+		}},
+		{"issued at beyond skew", func(claims map[string]any) {
+			claims["iat"] = time.Now().Add(2 * time.Minute).Unix()
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newOIDCTestProvider(t)
+			c := p.newClient(t)
+
+			claims := p.baseClaims()
+			claims["nonce"] = "n0nce"
+			tc.mutate(claims)
+			p.setToken(marshalTokenResponse("access", "refresh", p.signIDToken(claims), 300, nil))
+
+			_, err := c.exchange(context.Background(), "code", "verifier", "n0nce")
+			wantOIDCError(t, err, oidcErrMalformed)
+		})
+	}
+}
+
+func TestExchangeAcceptsTimeClaimsWithinSkew(t *testing.T) {
+	p := newOIDCTestProvider(t)
+	c := p.newClient(t)
+
+	claims := p.baseClaims()
+	claims["exp"] = time.Now().Add(-30 * time.Second).Unix()
+	claims["nbf"] = time.Now().Add(30 * time.Second).Unix()
+	claims["iat"] = time.Now().Add(30 * time.Second).Unix()
+	claims["nonce"] = "n0nce"
+	p.setToken(marshalTokenResponse("access", "refresh", p.signIDToken(claims), 300, nil))
+
+	if _, err := c.exchange(context.Background(), "code", "verifier", "n0nce"); err != nil {
+		t.Fatalf("exchange returned error for claims within 60-second skew: %v", err)
+	}
 }
 
 func TestExchangeRejectsNonceMismatch(t *testing.T) {
@@ -597,6 +913,19 @@ func TestExchangeRejectsBadAtHash(t *testing.T) {
 	claims := p.baseClaims()
 	claims["nonce"] = "n0nce"
 	claims["at_hash"] = computeAtHash("some-other-access-token")
+	p.setToken(marshalTokenResponse("access-token", "refresh", p.signIDToken(claims), 300, nil))
+
+	_, err := c.exchange(context.Background(), "code", "verifier", "n0nce")
+	wantOIDCError(t, err, oidcErrMalformed)
+}
+
+func TestExchangeRejectsEmptyAtHash(t *testing.T) {
+	p := newOIDCTestProvider(t)
+	c := p.newClient(t)
+
+	claims := p.baseClaims()
+	claims["nonce"] = "n0nce"
+	claims["at_hash"] = ""
 	p.setToken(marshalTokenResponse("access-token", "refresh", p.signIDToken(claims), 300, nil))
 
 	_, err := c.exchange(context.Background(), "code", "verifier", "n0nce")
@@ -645,6 +974,75 @@ func TestExchangeRejectsMalformedIDToken(t *testing.T) {
 
 	_, err := c.exchange(context.Background(), "code", "verifier", "n0nce")
 	wantOIDCError(t, err, oidcErrMalformed)
+}
+
+func TestExchangeCachesJWKS(t *testing.T) {
+	p := newOIDCTestProvider(t)
+	c := p.newClient(t)
+	claims := p.baseClaims()
+	claims["nonce"] = "n0nce"
+	p.setToken(marshalTokenResponse("access", "refresh", p.signIDToken(claims), 300, nil))
+
+	for i := 0; i < 2; i++ {
+		if _, err := c.exchange(context.Background(), "code", "verifier", "n0nce"); err != nil {
+			t.Fatalf("exchange %d returned error: %v", i+1, err)
+		}
+	}
+	if got := p.jwksRequestCount(); got != 1 {
+		t.Fatalf("JWKS requests = %d, want 1", got)
+	}
+}
+
+func TestExchangeRefetchesJWKSOnceForUnknownKid(t *testing.T) {
+	p := newOIDCTestProvider(t)
+	c := p.newClient(t)
+	claims := p.baseClaims()
+	claims["nonce"] = "n0nce"
+	p.setToken(marshalTokenResponse("access", "refresh", p.signIDToken(claims), 300, nil))
+	if _, err := c.exchange(context.Background(), "code", "verifier", "n0nce"); err != nil {
+		t.Fatalf("initial exchange returned error: %v", err)
+	}
+
+	unknownKeyToken := signIDTokenWithAlgorithm(t, "RS256", "unknown-key", p.key, claims)
+	p.setToken(marshalTokenResponse("access", "refresh", unknownKeyToken, 300, nil))
+	_, err := c.exchange(context.Background(), "code", "verifier", "n0nce")
+	wantOIDCError(t, err, oidcErrMalformed)
+	if got := p.jwksRequestCount(); got != 2 {
+		t.Fatalf("JWKS requests = %d, want initial fetch and one refetch", got)
+	}
+}
+
+func TestExchangeConcurrentCachedJWKS(t *testing.T) {
+	p := newOIDCTestProvider(t)
+	c := p.newClient(t)
+	claims := p.baseClaims()
+	claims["nonce"] = "n0nce"
+	p.setToken(marshalTokenResponse("access", "refresh", p.signIDToken(claims), 300, nil))
+	if _, err := c.exchange(context.Background(), "code", "verifier", "n0nce"); err != nil {
+		t.Fatalf("initial exchange returned error: %v", err)
+	}
+
+	const exchanges = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, exchanges)
+	for i := 0; i < exchanges; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := c.exchange(context.Background(), "code", "verifier", "n0nce")
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent exchange returned error: %v", err)
+		}
+	}
+	if got := p.jwksRequestCount(); got != 1 {
+		t.Fatalf("JWKS requests = %d, want 1", got)
+	}
 }
 
 func TestExchangeRejectsUnsupportedProviderAlgorithm(t *testing.T) {
@@ -736,6 +1134,20 @@ func TestRefreshKeepsRefreshTokenWhenNotRotated(t *testing.T) {
 	if ts.RefreshToken != "old-refresh-token" {
 		t.Fatalf("RefreshToken = %q, want old-refresh-token retained", ts.RefreshToken)
 	}
+}
+
+func TestRefreshRejectsNonStringIDToken(t *testing.T) {
+	p := newOIDCTestProvider(t)
+	c := p.newClient(t)
+	p.setToken(mustJSON(map[string]any{
+		"access_token":  "access",
+		"refresh_token": "refresh",
+		"expires_in":    300,
+		"id_token":      123,
+	}))
+
+	_, err := c.refresh(context.Background(), "old-refresh-token")
+	wantOIDCError(t, err, oidcErrMalformed)
 }
 
 func TestRefreshRejectsBadIDTokenSignature(t *testing.T) {

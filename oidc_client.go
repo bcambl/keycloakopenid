@@ -2,6 +2,10 @@ package keycloakopenid
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/sha512"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,8 +13,9 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
-	"github.com/coreos/go-oidc/v3/oidc"
+	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/oauth2"
 )
 
@@ -31,9 +36,19 @@ type oidcClient struct {
 	clientID         string
 	clientSecret     string
 	oauth            *oauth2.Config
-	verifier         *oidc.IDTokenVerifier
+	parser           *jwt.Parser
+	jwks             *jwksCache
 	introspectionURL string
 	upstream         *http.Client
+}
+
+type validatedIDToken struct {
+	Subject         string
+	Nonce           string
+	Audience        []string
+	AccessTokenHash string
+	Algorithm       string
+	Claims          jwt.MapClaims
 }
 
 // identity carries the validated claims of a signed ID token.
@@ -105,68 +120,78 @@ func newOIDCClient(ctx context.Context, cfg runtimeConfig) (*oidcClient, error) 
 		return nil, errors.New("oidc: upstream client is required")
 	}
 
-	provider, introspectionURL, advertised, err := discoverProvider(ctx, cfg)
+	provider, err := discoverProvider(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
-
-	algs, err := signingAlgorithms(advertised)
+	algs, err := signingAlgorithms(provider.algorithms)
 	if err != nil {
 		return nil, newOIDCError(oidcErrMalformed, err)
 	}
-
-	endpoint := provider.Endpoint()
-	endpoint.AuthStyle = oauth2.AuthStyleInParams
 
 	oauth := &oauth2.Config{
 		ClientID:     cfg.ClientID,
 		ClientSecret: cfg.ClientSecret,
 		RedirectURL:  cfg.CallbackURL,
-		Endpoint:     endpoint,
-		Scopes:       oauthScopes(cfg.Scope),
+		Endpoint: oauth2.Endpoint{
+			AuthURL:   provider.authURL,
+			TokenURL:  provider.tokenURL,
+			AuthStyle: oauth2.AuthStyleInParams,
+		},
+		Scopes: oauthScopes(cfg.Scope),
 	}
-
-	verifier := provider.Verifier(&oidc.Config{
-		ClientID:             cfg.ClientID,
-		SupportedSigningAlgs: algs,
-	})
+	parser := jwt.NewParser(
+		jwt.WithValidMethods(algs),
+		jwt.WithIssuer(cfg.Issuer),
+		jwt.WithAudience(cfg.ClientID),
+		jwt.WithExpirationRequired(),
+		jwt.WithIssuedAt(),
+		jwt.WithLeeway(time.Minute),
+	)
 
 	return &oidcClient{
 		clientID:         cfg.ClientID,
 		clientSecret:     cfg.ClientSecret,
 		oauth:            oauth,
-		verifier:         verifier,
-		introspectionURL: introspectionURL,
+		parser:           parser,
+		jwks:             &jwksCache{client: cfg.Upstream, url: provider.jwksURL},
+		introspectionURL: provider.introspectionURL,
 		upstream:         cfg.Upstream,
 	}, nil
 }
 
-// discoverProvider fetches the OpenID Connect discovery document and builds a
-// provider from it. Discovery failures are classified without exposing the
-// upstream body.
-func discoverProvider(ctx context.Context, cfg runtimeConfig) (*oidc.Provider, string, []string, error) {
+type providerMetadata struct {
+	authURL          string
+	tokenURL         string
+	jwksURL          string
+	introspectionURL string
+	algorithms       []string
+}
+
+// discoverProvider fetches and validates provider metadata without exposing
+// the upstream response body.
+func discoverProvider(ctx context.Context, cfg runtimeConfig) (providerMetadata, error) {
 	wellKnown := strings.TrimSuffix(cfg.Issuer, "/") + "/.well-known/openid-configuration"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wellKnown, nil)
 	if err != nil {
-		return nil, "", nil, newOIDCError(oidcErrMalformed, err)
+		return providerMetadata{}, newOIDCError(oidcErrMalformed, errors.New("oidc: invalid discovery endpoint"))
 	}
 
 	resp, err := cfg.Upstream.Do(req)
 	if err != nil {
-		return nil, "", nil, newOIDCError(oidcErrOutage, errors.New("oidc: discovery unavailable"))
+		return providerMetadata{}, newOIDCError(oidcErrOutage, errors.New("oidc: discovery unavailable"))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamResponse+1))
 	if err != nil {
-		return nil, "", nil, newOIDCError(oidcErrMalformed, errors.New("oidc: discovery response unreadable"))
+		return providerMetadata{}, newOIDCError(oidcErrMalformed, errors.New("oidc: discovery response unreadable"))
 	}
 	if len(body) > maxUpstreamResponse {
-		return nil, "", nil, newOIDCError(oidcErrMalformed, errors.New("oidc: discovery response exceeds limit"))
+		return providerMetadata{}, newOIDCError(oidcErrMalformed, errors.New("oidc: discovery response exceeds limit"))
 	}
-
 	if resp.StatusCode != http.StatusOK {
-		return nil, "", nil, newOIDCError(discoveryErrorKind(resp.StatusCode), fmt.Errorf("oidc: discovery returned status %d", resp.StatusCode))
+		return providerMetadata{}, newOIDCError(discoveryErrorKind(resp.StatusCode), fmt.Errorf("oidc: discovery returned status %d", resp.StatusCode))
 	}
 
 	var doc struct {
@@ -178,26 +203,39 @@ func discoverProvider(ctx context.Context, cfg runtimeConfig) (*oidc.Provider, s
 		Algorithms    []string `json:"id_token_signing_alg_values_supported"`
 	}
 	if err := json.Unmarshal(body, &doc); err != nil {
-		return nil, "", nil, newOIDCError(oidcErrMalformed, errors.New("oidc: malformed discovery document"))
+		return providerMetadata{}, newOIDCError(oidcErrMalformed, errors.New("oidc: malformed discovery document"))
 	}
 	if doc.Issuer != cfg.Issuer {
-		return nil, "", nil, newOIDCError(oidcErrMalformed, errors.New("oidc: issuer mismatch"))
+		return providerMetadata{}, newOIDCError(oidcErrMalformed, errors.New("oidc: issuer mismatch"))
 	}
-
-	provider := (&oidc.ProviderConfig{
-		IssuerURL:  doc.Issuer,
-		AuthURL:    doc.AuthURL,
-		TokenURL:   doc.TokenURL,
-		JWKSURL:    doc.JWKSURL,
-		Algorithms: doc.Algorithms,
-	}).NewProvider(oidc.ClientContext(ctx, cfg.Upstream))
+	for _, endpoint := range []string{doc.AuthURL, doc.TokenURL, doc.JWKSURL} {
+		if !validProviderURL(endpoint) {
+			return providerMetadata{}, newOIDCError(oidcErrMalformed, errors.New("oidc: discovery contains invalid endpoint"))
+		}
+	}
+	if doc.Introspection != "" && !validProviderURL(doc.Introspection) {
+		return providerMetadata{}, newOIDCError(oidcErrMalformed, errors.New("oidc: discovery contains invalid introspection endpoint"))
+	}
 
 	introspectionURL := doc.Introspection
 	if introspectionURL == "" {
 		introspectionURL = strings.TrimSuffix(cfg.Issuer, "/") + "/protocol/openid-connect/token/introspect"
 	}
+	return providerMetadata{
+		authURL:          doc.AuthURL,
+		tokenURL:         doc.TokenURL,
+		jwksURL:          doc.JWKSURL,
+		introspectionURL: introspectionURL,
+		algorithms:       doc.Algorithms,
+	}, nil
+}
 
-	return provider, introspectionURL, doc.Algorithms, nil
+func validProviderURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || !u.IsAbs() || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Scheme, "http") || strings.EqualFold(u.Scheme, "https")
 }
 
 func discoveryErrorKind(status int) oidcErrKind {
@@ -242,7 +280,7 @@ func oauthScopes(scope string) []string {
 }
 
 func (c *oidcClient) withClient(ctx context.Context) context.Context {
-	return oidc.ClientContext(ctx, c.upstream)
+	return context.WithValue(ctx, oauth2.HTTPClient, c.upstream)
 }
 
 func (c *oidcClient) authCodeURL(state, nonce, codeChallenge string) string {
@@ -270,7 +308,7 @@ func (c *oidcClient) exchange(ctx context.Context, code, verifier, nonce string)
 	if err != nil {
 		return nil, err
 	}
-	if idToken.Nonce != nonce {
+	if subtle.ConstantTimeCompare([]byte(idToken.Nonce), []byte(nonce)) != 1 {
 		return nil, newOIDCError(oidcErrMalformed, errors.New("oidc: id token nonce mismatch"))
 	}
 
@@ -283,8 +321,12 @@ func (c *oidcClient) refresh(ctx context.Context, refreshToken string) (*tokenSe
 		return nil, sanitizeOAuthErr(err)
 	}
 
-	rawID, _ := tok.Extra("id_token").(string)
-	var idToken *oidc.IDToken
+	rawIDValue := tok.Extra("id_token")
+	rawID, ok := rawIDValue.(string)
+	if rawIDValue != nil && !ok {
+		return nil, newOIDCError(oidcErrMalformed, errors.New("oidc: token response has invalid id_token"))
+	}
+	var idToken *validatedIDToken
 	if rawID != "" {
 		idToken, err = c.validateIDToken(ctx, rawID, tok.AccessToken)
 		if err != nil {
@@ -295,47 +337,105 @@ func (c *oidcClient) refresh(ctx context.Context, refreshToken string) (*tokenSe
 	return c.buildTokenSet(tok, idToken)
 }
 
-// validateIDToken verifies the signature, issuer, audience, authorized party,
-// expiry, and access-token hash of an ID token. The nonce is validated by the
-// caller.
-func (c *oidcClient) validateIDToken(ctx context.Context, rawID, accessToken string) (*oidc.IDToken, error) {
+// validateIDToken verifies the signature, registered claims, authorized party,
+// and access-token hash of an ID token. The nonce is validated by the caller.
+func (c *oidcClient) validateIDToken(ctx context.Context, rawID, accessToken string) (*validatedIDToken, error) {
 	if rawID == "" {
 		return nil, newOIDCError(oidcErrMalformed, errors.New("oidc: token response missing id_token"))
 	}
-	idToken, err := c.verifier.Verify(ctx, rawID)
+
+	claims := jwt.MapClaims{}
+	token, err := c.parser.ParseWithClaims(rawID, claims, func(token *jwt.Token) (any, error) {
+		return c.jwks.verificationKey(ctx, token)
+	})
+	if err != nil || token == nil || !token.Valid {
+		return nil, newOIDCError(oidcErrMalformed, errors.New("oidc: id token validation failed"))
+	}
+
+	subject, err := claims.GetSubject()
+	if err != nil || subject == "" {
+		return nil, newOIDCError(oidcErrMalformed, errors.New("oidc: id token missing valid subject"))
+	}
+	audience, err := claims.GetAudience()
+	if err != nil {
+		return nil, newOIDCError(oidcErrMalformed, errors.New("oidc: id token has invalid audience"))
+	}
+	nonce, err := idTokenStringClaim(claims, "nonce")
 	if err != nil {
 		return nil, newOIDCError(oidcErrMalformed, err)
+	}
+	atHash, err := idTokenStringClaim(claims, "at_hash")
+	if err != nil {
+		return nil, newOIDCError(oidcErrMalformed, err)
+	}
+	idToken := &validatedIDToken{
+		Subject:         subject,
+		Nonce:           nonce,
+		Audience:        []string(audience),
+		AccessTokenHash: atHash,
+		Algorithm:       token.Method.Alg(),
+		Claims:          claims,
 	}
 	if err := c.checkAuthorizedParty(idToken); err != nil {
 		return nil, newOIDCError(oidcErrMalformed, err)
 	}
-	if idToken.AccessTokenHash != "" {
-		if err := idToken.VerifyAccessToken(accessToken); err != nil {
+	if _, present := claims["at_hash"]; present {
+		if err := verifyAccessTokenHash(accessToken, atHash, idToken.Algorithm); err != nil {
 			return nil, newOIDCError(oidcErrMalformed, err)
 		}
 	}
 	return idToken, nil
 }
 
-// checkAuthorizedParty enforces the OIDC authorized-party rule: an ID token
-// with multiple audiences must carry an azp claim identifying this client.
-func (c *oidcClient) checkAuthorizedParty(idToken *oidc.IDToken) error {
-	if len(idToken.Audience) <= 1 {
+func idTokenStringClaim(claims jwt.MapClaims, name string) (string, error) {
+	raw, ok := claims[name]
+	if !ok {
+		return "", nil
+	}
+	value, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("oidc: id token has invalid %s claim", name)
+	}
+	return value, nil
+}
+
+// checkAuthorizedParty requires multiple audiences to identify this client and
+// rejects any explicitly provided authorized party for another client.
+func (c *oidcClient) checkAuthorizedParty(idToken *validatedIDToken) error {
+	raw, present := idToken.Claims["azp"]
+	if !present && len(idToken.Audience) <= 1 {
 		return nil
 	}
-	var claims struct {
-		AuthorizedParty string `json:"azp"`
-	}
-	if err := idToken.Claims(&claims); err != nil {
-		return err
-	}
-	if claims.AuthorizedParty != c.clientID {
+	authorizedParty, ok := raw.(string)
+	if !ok || authorizedParty != c.clientID {
 		return errors.New("oidc: id token missing valid authorized party")
 	}
 	return nil
 }
 
-func (c *oidcClient) buildTokenSet(tok *oauth2.Token, idToken *oidc.IDToken) (*tokenSet, error) {
+func verifyAccessTokenHash(accessToken, expected, alg string) error {
+	var digest []byte
+	switch alg {
+	case "RS256", "PS256", "ES256":
+		sum := sha256.Sum256([]byte(accessToken))
+		digest = sum[:]
+	case "RS384", "PS384", "ES384":
+		sum := sha512.Sum384([]byte(accessToken))
+		digest = sum[:]
+	case "RS512", "PS512", "ES512", "EdDSA":
+		sum := sha512.Sum512([]byte(accessToken))
+		digest = sum[:]
+	default:
+		return errors.New("oidc: unsupported id token signing algorithm")
+	}
+	actual := base64.RawURLEncoding.EncodeToString(digest[:len(digest)/2])
+	if subtle.ConstantTimeCompare([]byte(actual), []byte(expected)) != 1 {
+		return errors.New("oidc: id token access token hash mismatch")
+	}
+	return nil
+}
+
+func (c *oidcClient) buildTokenSet(tok *oauth2.Token, idToken *validatedIDToken) (*tokenSet, error) {
 	refreshExp, err := refreshExpirySeconds(tok)
 	if err != nil {
 		return nil, newOIDCError(oidcErrMalformed, err)
@@ -348,11 +448,7 @@ func (c *oidcClient) buildTokenSet(tok *oauth2.Token, idToken *oidc.IDToken) (*t
 		RefreshExpiresIn: refreshExp,
 	}
 	if idToken != nil {
-		var claims map[string]any
-		if err := idToken.Claims(&claims); err != nil {
-			return nil, newOIDCError(oidcErrMalformed, err)
-		}
-		ts.Identity = identity{Subject: idToken.Subject, Claims: claims}
+		ts.Identity = identity{Subject: idToken.Subject, Claims: map[string]any(idToken.Claims)}
 	}
 	return ts, nil
 }
