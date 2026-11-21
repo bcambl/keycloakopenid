@@ -1,0 +1,41 @@
+---
+- name: Create the local plugin source directory on the VM
+  ansible.builtin.file:
+    path: "{{ plugin_source_path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Copy the plugin Go sources and Traefik metadata to the VM
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ plugin_source_path }}/"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ query('fileglob', playbook_dir + '/../../*.go') + [playbook_dir + '/../../go.mod', playbook_dir + '/../../.traefik.yml'] }}"
+
+- name: Configure the packaged Traefik chart for the local plugin
+  ansible.builtin.template:
+    src: traefik-helmchartconfig.yaml.j2
+    dest: /var/lib/rancher/k3s/server/manifests/traefik-config.yaml
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Wait for Traefik to become ready with the configured chart
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/k3s
+      - kubectl
+      - rollout
+      - status
+      - deployment/traefik
+      - --namespace=kube-system
+      - --timeout=60s
+  register: traefik_rollout
+  changed_when: false
+  retries: 10
+  delay: 6
+  until: traefik_rollout.rc == 0

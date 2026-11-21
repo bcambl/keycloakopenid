@@ -1,0 +1,83 @@
+{% set client = keycloak_clients | selectattr('id', 'equalto', 'helloworld-shared') | first %}
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: shared-auth
+  namespace: {{ demo_namespace }}
+  labels:
+    app.kubernetes.io/part-of: keycloakopenid-demo
+    demo-mode: shared
+spec:
+  plugin:
+    keycloakopenid:
+      KeycloakURL: {{ keycloak_url }}
+      InsecureSkipVerify: true
+      ClientID: {{ client.id }}
+      ClientSecret: {{ client.secret }}
+      KeycloakRealm: demo
+      Scope: openid profile email
+      UseAuthHeader: true
+      IgnorePathPrefixes: /favicon.ico,/healthz
+---
+# A single router (and therefore a single plugin instance and session store)
+# authenticates every app path, then hands the request to Traefik's own
+# cluster-internal entrypoint, where per-path routers strip the prefix.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: helloworld-shared-auth
+  namespace: {{ demo_namespace }}
+  labels:
+    app.kubernetes.io/part-of: keycloakopenid-demo
+    demo-mode: shared
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: {{ helloworld_apps | map(attribute='name') | map('regex_replace', '^(.*)$', 'PathPrefix(`/\\1`)') | join(' || ') }}
+      middlewares:
+        - name: shared-auth
+      services:
+        - name: traefik-internal
+          namespace: kube-system
+          port: {{ traefik_internal_port }}
+  tls:
+    secretName: demo-tls
+{% for app in helloworld_apps %}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ app.name }}-shared-strip
+  namespace: {{ demo_namespace }}
+  labels:
+    app.kubernetes.io/part-of: keycloakopenid-demo
+    demo-mode: shared
+spec:
+  stripPrefix:
+    prefixes:
+      - /{{ app.name }}
+{% endfor %}
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: helloworld-shared-internal
+  namespace: {{ demo_namespace }}
+  labels:
+    app.kubernetes.io/part-of: keycloakopenid-demo
+    demo-mode: shared
+spec:
+  entryPoints:
+    - internal
+  routes:
+{% for app in helloworld_apps %}
+    - kind: Rule
+      match: PathPrefix(`/{{ app.name }}`)
+      middlewares:
+        - name: {{ app.name }}-shared-strip
+      services:
+        - name: {{ app.name }}
+          port: 80
+{% endfor %}

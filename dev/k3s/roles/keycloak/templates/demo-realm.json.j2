@@ -1,0 +1,53 @@
+{
+  "realm": "demo",
+  "enabled": true,
+  "sslRequired": "external",
+  "clients": [
+{% for client in keycloak_clients %}
+    {
+      "clientId": "{{ client.id }}",
+      "name": "{{ client.id }}",
+      "enabled": true,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "{{ client.secret }}",
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": {{ client.paths | map('regex_replace', '^(.*)$', 'https://' ~ vm_host ~ '\\1*') | list | to_json }},
+      "webOrigins": ["https://{{ vm_host }}"]
+    }{{ "," if not loop.last else "" }}
+{% endfor %}
+  ],
+  "users": [
+    {
+      "username": "alice",
+      "enabled": true,
+      "email": "alice@example.test",
+      "emailVerified": true,
+      "firstName": "Alice",
+      "lastName": "Example",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "alice-password",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "bob",
+      "enabled": true,
+      "email": "bob@example.test",
+      "emailVerified": true,
+      "firstName": "Bob",
+      "lastName": "Example",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "bob-password",
+          "temporary": false
+        }
+      ]
+    }
+  ]
+}

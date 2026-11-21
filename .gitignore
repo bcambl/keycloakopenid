@@ -1,0 +1,6 @@
+.venv/
+coverage.out
+dev/k3s/.kubeconfig
+__pycache__/
+.envrc
+coverage.*

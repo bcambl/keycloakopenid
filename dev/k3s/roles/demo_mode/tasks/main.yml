@@ -1,0 +1,44 @@
+---
+- name: Validate the requested demo mode
+  ansible.builtin.assert:
+    that:
+      - demo_mode in ['per-app', 'shared']
+    fail_msg: "demo_mode must be 'per-app' or 'shared', got '{{ demo_mode }}'"
+    quiet: true
+
+- name: Create the manifest directory on the VM
+  ansible.builtin.file:
+    path: "{{ manifest_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Render the {{ demo_mode }} routing manifest
+  ansible.builtin.template:
+    src: "{{ demo_mode }}.yaml.j2"
+    dest: "{{ manifest_dir }}/demo-mode.yaml"
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Remove routing resources that belong to the other demo mode
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/k3s
+      - kubectl
+      - delete
+      - ingressroutes.traefik.io,middlewares.traefik.io
+      - "--namespace={{ demo_namespace }}"
+      - "--selector=app.kubernetes.io/part-of=keycloakopenid-demo,demo-mode,demo-mode!={{ demo_mode }}"
+      - --ignore-not-found
+  register: demo_mode_prune
+  changed_when: "'deleted' in demo_mode_prune.stdout"
+
+- name: Apply the {{ demo_mode }} routing manifest
+  ansible.builtin.include_tasks:
+    file: "{{ playbook_dir }}/tasks/apply-manifest.yml"
+    apply:
+      tags: [demo_mode]
+  vars:
+    manifest_path: "{{ manifest_dir }}/demo-mode.yaml"

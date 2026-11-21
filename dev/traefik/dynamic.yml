@@ -1,0 +1,48 @@
+http:
+  routers:
+    helloworld1:
+      entryPoints:
+        - web
+      rule: Host(`helloworld1.localhost`)
+      middlewares:
+        - helloworld1-auth
+      service: helloworld1
+    helloworld2:
+      entryPoints:
+        - web
+      rule: Host(`helloworld2.localhost`)
+      middlewares:
+        - helloworld2-auth
+      service: helloworld2
+
+  middlewares:
+    helloworld1-auth:
+      plugin:
+        keycloakopenid-local:
+          KeycloakURL: http://127.0.0.1:8081
+          ClientID: helloworld1
+          ClientSecret: helloworld1-dev-secret
+          KeycloakRealm: demo
+          Scope: openid profile email
+          UseAuthHeader: true
+          IgnorePathPrefixes: /favicon.ico,/healthz
+    helloworld2-auth:
+      plugin:
+        keycloakopenid-local:
+          KeycloakURL: http://127.0.0.1:8081
+          ClientID: helloworld2
+          ClientSecret: helloworld2-dev-secret
+          KeycloakRealm: demo
+          Scope: openid profile email
+          UseAuthHeader: true
+          IgnorePathPrefixes: /favicon.ico,/healthz
+
+  services:
+    helloworld1:
+      loadBalancer:
+        servers:
+          - url: http://127.0.0.1:9001
+    helloworld2:
+      loadBalancer:
+        servers:
+          - url: http://127.0.0.1:9002

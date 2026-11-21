@@ -1,0 +1,29 @@
+---
+vm_host: "{{ lookup('env', 'VM_HOST') }}"
+vm_host_san: "{{ ('IP:' ~ vm_host) if vm_host is match('^[0-9.]+$') else ('DNS:' ~ vm_host) }}"
+k3s_version: v1.37.2+k3s1
+demo_namespace: demo
+demo_mode: per-app
+traefik_internal_port: 8001
+plugin_source_path: /opt/keycloakopenid/src/github.com/bcambl/keycloakopenid
+plugin_module_name: github.com/bcambl/keycloakopenid
+plugin_mount_path: /plugins-local/src/github.com/bcambl/keycloakopenid
+manifest_dir: /opt/keycloakopenid/manifests
+keycloak_image: quay.io/keycloak/keycloak:26.3.5
+keycloak_url: "https://{{ vm_host }}/auth"
+keycloak_clients:
+  - id: helloworld1
+    secret: helloworld1-dev-secret
+    paths: [/helloworld1]
+  - id: helloworld2
+    secret: helloworld2-dev-secret
+    paths: [/helloworld2]
+  - id: helloworld-shared
+    secret: helloworld-shared-dev-secret
+    paths: [/helloworld1, /helloworld2]
+helloworld_image: localhost/helloworld:dev
+helloworld_apps:
+  - name: helloworld1
+    other: helloworld2
+  - name: helloworld2
+    other: helloworld1

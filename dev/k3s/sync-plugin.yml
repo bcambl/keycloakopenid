@@ -1,0 +1,33 @@
+---
+- name: Synchronize the local Traefik plugin
+  hosts: all
+  become: true
+  roles:
+    - plugin
+  tasks:
+    - name: Restart Traefik to reload the plugin source
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - rollout
+          - restart
+          - deployment/traefik
+          - --namespace=kube-system
+      changed_when: true
+
+    - name: Wait for Traefik to become ready after the restart
+      ansible.builtin.command:
+        argv:
+          - k3s
+          - kubectl
+          - rollout
+          - status
+          - deployment/traefik
+          - --namespace=kube-system
+          - --timeout=60s
+      register: traefik_rollout
+      changed_when: false
+      retries: 10
+      delay: 6
+      until: traefik_rollout.rc == 0

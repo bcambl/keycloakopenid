@@ -1,0 +1,14 @@
+---
+- name: Configure the k3s path-based demo
+  hosts: all
+  become: true
+  roles:
+    - fedora_prep
+    - k3s
+    - plugin
+    - tls
+    - images
+    - keycloak
+    - apps
+    - role: demo_mode
+      tags: [demo_mode]

@@ -1,0 +1,26 @@
+---
+- name: Render the helloworld manifest
+  ansible.builtin.template:
+    src: helloworld.yaml.j2
+    dest: "{{ manifest_dir }}/helloworld.yaml"
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Apply the helloworld manifest
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/apply-manifest.yml"
+  vars:
+    manifest_path: "{{ manifest_dir }}/helloworld.yaml"
+
+- name: Wait for the helloworld apps to become ready
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/k3s
+      - kubectl
+      - rollout
+      - status
+      - "deployment/{{ item.name }}"
+      - "--namespace={{ demo_namespace }}"
+      - --timeout=180s
+  loop: "{{ helloworld_apps }}"
+  changed_when: false

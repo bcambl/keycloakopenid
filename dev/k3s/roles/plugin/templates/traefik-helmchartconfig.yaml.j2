@@ -1,0 +1,42 @@
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    ports:
+      web:
+        redirectTo:
+          port: websecure
+      internal:
+        port: {{ traefik_internal_port }}
+        exposedPort: {{ traefik_internal_port }}
+        expose:
+          default: false
+          internal: true
+        protocol: TCP
+    providers:
+      kubernetesCRD:
+        allowCrossNamespace: true
+    service:
+      additionalServices:
+        internal:
+          spec:
+            type: ClusterIP
+          labels:
+            traefik-service-label: internal
+{% if vm_host is not match('^[0-9.]+$') %}
+    deployment:
+      hostAliases:
+        - ip: "{{ ansible_default_ipv4.address }}"
+          hostnames:
+            - "{{ vm_host }}"
+{% endif %}
+    experimental:
+      localPlugins:
+        keycloakopenid:
+          moduleName: {{ plugin_module_name }}
+          mountPath: {{ plugin_mount_path }}
+          type: hostPath
+          hostPath: {{ plugin_source_path }}
