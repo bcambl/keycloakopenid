@@ -191,7 +191,7 @@ func discoverProvider(ctx context.Context, cfg runtimeConfig) (providerMetadata,
 		return providerMetadata{}, newOIDCError(oidcErrMalformed, errors.New("oidc: discovery response exceeds limit"))
 	}
 	if resp.StatusCode != http.StatusOK {
-		return providerMetadata{}, newOIDCError(discoveryErrorKind(resp.StatusCode), fmt.Errorf("oidc: discovery returned status %d", resp.StatusCode))
+		return providerMetadata{}, newOIDCError(discoveryErrorKind(resp.StatusCode), fmt.Errorf("oidc: discovery path %q returned status %d", req.URL.EscapedPath(), resp.StatusCode))
 	}
 
 	var doc struct {

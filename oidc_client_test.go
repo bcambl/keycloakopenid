@@ -383,6 +383,7 @@ func TestNewOIDCClientRejectsNoAsymmetricAlgorithm(t *testing.T) {
 func TestNewOIDCClientDiscoveryOutage(t *testing.T) {
 	p := newOIDCTestProvider(t)
 	p.discoveryStatus = http.StatusInternalServerError
+	p.discoveryBody = `{"error":"SECRET_LEAK_MARKER"}`
 	_, err := newOIDCClient(context.Background(), runtimeConfig{
 		Issuer:       p.issuer,
 		ClientID:     p.clientID,
@@ -392,6 +393,16 @@ func TestNewOIDCClientDiscoveryOutage(t *testing.T) {
 		Upstream:     newUpstreamHTTPClient(false),
 	})
 	wantOIDCError(t, err, oidcErrOutage)
+	for _, want := range []string{`path "/realms/r/.well-known/openid-configuration"`, "status 500"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want it to contain %q", err, want)
+		}
+	}
+	for _, disallowed := range []string{p.srv.URL, "SECRET_LEAK_MARKER"} {
+		if strings.Contains(err.Error(), disallowed) {
+			t.Fatalf("error = %q, must not contain %q", err, disallowed)
+		}
+	}
 }
 
 func TestNewOIDCClientMalformedDiscovery(t *testing.T) {
