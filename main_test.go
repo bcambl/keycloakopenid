@@ -163,6 +163,8 @@ func TestResolveReturnTarget(t *testing.T) {
 	cases := []struct{ target, want string }{
 		{"/dashboard", "https://app.test/dashboard"},
 		{"/dashboard?tab=1", "https://app.test/dashboard?tab=1"},
+		{"/foo%3Fbar", "https://app.test/foo%3Fbar"},
+		{"/foo%3fbar?next=%2F", "https://app.test/foo%3fbar?next=%2F"},
 		{"/", "https://app.test/"},
 	}
 	for _, tc := range cases {

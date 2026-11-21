@@ -268,7 +268,12 @@ func safeReturnTarget(requestURL *url.URL) (string, error) {
 	if unsafeReturnTarget(requestURL.Path) || unsafeReturnTarget(requestURL.RawPath) || unsafeReturnTarget(requestURL.RawQuery) {
 		return "", errors.New("return target contains unsafe characters")
 	}
-	path := requestURL.Path
+	if requestURL.RawPath != "" {
+		if _, err := url.PathUnescape(requestURL.RawPath); err != nil {
+			return "", errors.New("return target contains malformed escapes")
+		}
+	}
+	path := requestURL.EscapedPath()
 	if path == "" {
 		path = "/"
 	} else if strings.HasPrefix(path, "//") {

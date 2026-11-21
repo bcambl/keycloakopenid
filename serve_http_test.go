@@ -362,6 +362,12 @@ func TestForwardingNoAuthHeaderWhenDisabled(t *testing.T) {
 	}
 }
 
+func TestEscapedReturnPathRoundTrip(t *testing.T) {
+	p := newOIDCTestProvider(t)
+	auth := newAuth(t, p, nil)
+	completeLogin(t, auth, p, "/foo%3Fbar?next=%2F")
+}
+
 // TestSpoofedHeadersStripped proves incoming user/authorization headers are
 // removed before forwarding, replaced only by validated session data.
 func TestSpoofedHeadersStripped(t *testing.T) {
@@ -428,6 +434,97 @@ func TestIgnoredPathSegmentMatchingIntegration(t *testing.T) {
 	auth.ServeHTTP(rw, apiGet("https://app.test/api/users"))
 	if rw.Code != http.StatusOK || !cap.called {
 		t.Fatalf("status = %d, called = %t; /api/users must be ignored", rw.Code, cap.called)
+	}
+}
+
+func TestAmbiguousRequestPathsRejectedBeforeIgnoredRouting(t *testing.T) {
+	cases := []struct {
+		name   string
+		target string
+	}{
+		{"literal parent segment", "https://app.test/healthz/../admin"},
+		{"encoded parent segment", "https://app.test/healthz/%2e%2e/admin"},
+		{"partially encoded parent segment", "https://app.test/healthz/.%2E/admin"},
+		{"encoded current segment", "https://app.test/healthz/%2E/admin"},
+		{"encoded slash", "https://app.test/healthz%2fadmin"},
+		{"encoded backslash", "https://app.test/healthz%5Cadmin"},
+		{"encoded nul", "https://app.test/healthz/%00admin"},
+		{"literal backslash", "https://app.test/healthz\\..\\admin"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newOIDCTestProvider(t)
+			auth := newAuth(t, p, func(c *Config) { c.IgnorePathPrefixes = "/healthz" })
+			cap := &capture{}
+			auth.next = cap.handler()
+
+			rw := httptest.NewRecorder()
+			auth.ServeHTTP(rw, apiGet(tc.target))
+
+			if rw.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", rw.Code)
+			}
+			if cap.called {
+				t.Fatal("ambiguous path must not be forwarded")
+			}
+		})
+	}
+}
+
+func TestMalformedAndControlRequestPathsRejected(t *testing.T) {
+	cases := []struct {
+		name    string
+		path    string
+		rawPath string
+	}{
+		{"malformed escape", "/healthz/%zz", "/healthz/%zz"},
+		{"short escape", "/healthz/%2", "/healthz/%2"},
+		{"literal control", "/healthz/\x00admin", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newOIDCTestProvider(t)
+			auth := newAuth(t, p, func(c *Config) { c.IgnorePathPrefixes = "/healthz" })
+			cap := &capture{}
+			auth.next = cap.handler()
+			req := apiGet("https://app.test/healthz")
+			req.URL.Path = tc.path
+			req.URL.RawPath = tc.rawPath
+
+			rw := httptest.NewRecorder()
+			auth.ServeHTTP(rw, req)
+
+			if rw.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", rw.Code)
+			}
+			if cap.called {
+				t.Fatal("invalid path must not be forwarded")
+			}
+		})
+	}
+}
+
+func TestSafeEscapedRequestPathsRemainValid(t *testing.T) {
+	for _, target := range []string{
+		"https://app.test/healthz",
+		"https://app.test/healthz/ready",
+		"https://app.test/healthz/hello%20world",
+		"https://app.test/healthz/foo%3Fbar",
+		"https://app.test/healthz/100%25",
+	} {
+		t.Run(target, func(t *testing.T) {
+			p := newOIDCTestProvider(t)
+			auth := newAuth(t, p, func(c *Config) { c.IgnorePathPrefixes = "/healthz" })
+			cap := &capture{}
+			auth.next = cap.handler()
+
+			rw := httptest.NewRecorder()
+			auth.ServeHTTP(rw, apiGet(target))
+
+			if rw.Code != http.StatusOK || !cap.called {
+				t.Fatalf("status = %d, called = %t; safe path must forward", rw.Code, cap.called)
+			}
+		})
 	}
 }
 

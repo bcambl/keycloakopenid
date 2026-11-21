@@ -60,6 +60,30 @@ func (k *keycloakAuth) isCallbackPath(path string) bool {
 	return k.CallbackURL != nil && path == k.CallbackURL.Path
 }
 
+func validRequestPath(u *url.URL) bool {
+	if u == nil {
+		return false
+	}
+	rawPath := u.RawPath
+	if rawPath == "" {
+		rawPath = u.EscapedPath()
+	}
+	lowerPath := strings.ToLower(rawPath)
+	if strings.Contains(lowerPath, "%2f") || strings.Contains(lowerPath, "%5c") || strings.Contains(lowerPath, "%00") {
+		return false
+	}
+	decodedPath, err := url.PathUnescape(rawPath)
+	if err != nil || unsafeReturnTarget(rawPath) || unsafeReturnTarget(decodedPath) {
+		return false
+	}
+	for _, segment := range strings.Split(decodedPath, "/") {
+		if segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
+}
+
 func (k *keycloakAuth) writeUnauthorized(rw http.ResponseWriter) {
 	rw.Header().Set("Content-Type", "application/json")
 	rw.Header().Set("Cache-Control", "no-store")
@@ -174,14 +198,11 @@ func (k *keycloakAuth) handleCallback(rw http.ResponseWriter, req *http.Request)
 // resolveReturnTarget restores a stored relative return target against the
 // configured callback origin.
 func resolveReturnTarget(callback *url.URL, target string) string {
-	u := url.URL{Scheme: callback.Scheme, Host: callback.Host}
-	if i := strings.IndexByte(target, '?'); i >= 0 {
-		u.Path = target[:i]
-		u.RawQuery = target[i+1:]
-	} else {
-		u.Path = target
+	rel, err := url.Parse(target)
+	if err != nil || !isSafeReturnTarget(target) {
+		return (&url.URL{Scheme: callback.Scheme, Host: callback.Host, Path: "/"}).String()
 	}
-	return u.String()
+	return callback.ResolveReference(rel).String()
 }
 
 func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -189,6 +210,11 @@ func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// routing; only validated sessions may reintroduce them.
 	req.Header.Del(k.UserHeaderName)
 	req.Header.Del("Authorization")
+
+	if !validRequestPath(req.URL) {
+		k.writeBadRequest(rw)
+		return
+	}
 
 	if k.isCallbackPath(req.URL.Path) {
 		k.handleCallback(rw, req)

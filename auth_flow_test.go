@@ -216,6 +216,8 @@ func TestSafeReturnTarget(t *testing.T) {
 	}{
 		{"path", &url.URL{Path: "/dashboard"}, "/dashboard", true},
 		{"path and query", &url.URL{Path: "/dashboard", RawQuery: "tab=1&x=2"}, "/dashboard?tab=1&x=2", true},
+		{"escaped question mark", &url.URL{Path: "/foo?bar", RawPath: "/foo%3Fbar"}, "/foo%3Fbar", true},
+		{"escaped path and query", &url.URL{Path: "/foo?bar", RawPath: "/foo%3fbar", RawQuery: "next=%2F"}, "/foo%3fbar?next=%2F", true},
 		{"root", &url.URL{Path: "/"}, "/", true},
 		{"empty path", &url.URL{}, "/", true},
 		{"absolute", &url.URL{Scheme: "https", Host: "evil.test", Path: "/x"}, "", false},
