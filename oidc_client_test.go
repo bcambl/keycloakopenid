@@ -105,8 +105,8 @@ func (p *oidcTestProvider) serveDiscovery(rw http.ResponseWriter) {
 }
 
 func (p *oidcTestProvider) serveJWKS(rw http.ResponseWriter) {
-	n := base64.RawURLEncoding.EncodeToString(p.key.PublicKey.N.Bytes())
-	e := base64.RawURLEncoding.EncodeToString(big.NewInt(int64(p.key.PublicKey.E)).Bytes())
+	n := base64.RawURLEncoding.EncodeToString(p.key.N.Bytes())
+	e := base64.RawURLEncoding.EncodeToString(big.NewInt(int64(p.key.E)).Bytes())
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(http.StatusOK)
 	_, _ = fmt.Fprintf(rw, `{"keys":[{"kty":"RSA","kid":%q,"alg":"RS256","use":"sig","n":%q,"e":%q}]}`, p.kid, n, e)

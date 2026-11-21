@@ -30,7 +30,7 @@ func TestNewUpstreamHTTPClientRefusesRedirect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get returned error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusFound {
 		t.Fatalf("status = %d, want 302 (redirect refused)", resp.StatusCode)
 	}
@@ -51,7 +51,7 @@ func TestNewUpstreamHTTPClientBoundedBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get returned error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != errResponseTooLarge {
 		t.Fatalf("ReadAll err = %v, want errResponseTooLarge", err)
@@ -73,7 +73,7 @@ func TestNewUpstreamHTTPClientUnderLimitBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get returned error: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("ReadAll returned error: %v", err)

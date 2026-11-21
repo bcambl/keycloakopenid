@@ -294,7 +294,7 @@ func (k *keycloakAuth) renewSession(ctx context.Context, session *Session, force
 // string.
 func (k *keycloakAuth) forwardSession(rw http.ResponseWriter, req *http.Request, session *Session) {
 	session.mu.Lock()
-	raw, ok := session.Claims[k.UserClaimName]
+	raw := session.Claims[k.UserClaimName]
 	session.mu.Unlock()
 
 	user, ok := raw.(string)

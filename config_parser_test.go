@@ -31,13 +31,12 @@ func newTestAuth(t *testing.T, config *Config) *keycloakAuth {
 	return auth
 }
 
-func newConfigError(t *testing.T, config *Config) error {
+func newConfigError(t *testing.T, config *Config) {
 	t.Helper()
 	_, err := New(context.Background(), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), config, "test")
 	if err == nil {
 		t.Fatal("New returned nil error, want error")
 	}
-	return err
 }
 
 // newProviderAuth returns a middleware backed by a fresh OIDC test provider,

@@ -94,16 +94,6 @@ func isOIDCRefusal(err error) bool {
 	return errors.As(err, &oe) && oe.kind == oidcErrRefusal
 }
 
-func isOIDCOutage(err error) bool {
-	var oe *oidcError
-	return errors.As(err, &oe) && oe.kind == oidcErrOutage
-}
-
-func isOIDCMalformed(err error) bool {
-	var oe *oidcError
-	return errors.As(err, &oe) && oe.kind == oidcErrMalformed
-}
-
 func newOIDCClient(ctx context.Context, cfg runtimeConfig) (*oidcClient, error) {
 	if cfg.Issuer == "" {
 		return nil, errors.New("oidc: issuer is required")
@@ -165,7 +155,7 @@ func discoverProvider(ctx context.Context, cfg runtimeConfig) (*oidc.Provider, s
 	if err != nil {
 		return nil, "", nil, newOIDCError(oidcErrOutage, errors.New("oidc: discovery unavailable"))
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamResponse+1))
 	if err != nil {
@@ -428,7 +418,7 @@ func (c *oidcClient) introspect(ctx context.Context, accessToken string) (tokenS
 	if err != nil {
 		return tokenUnavailable, newOIDCError(oidcErrOutage, errors.New("oidc: introspection unavailable"))
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	switch {
 	case resp.StatusCode == http.StatusOK:

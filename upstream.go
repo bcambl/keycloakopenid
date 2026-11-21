@@ -100,6 +100,6 @@ func endpointReachable(ctx context.Context, client *http.Client, target *url.URL
 	if err != nil {
 		return false, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	return resp.StatusCode == http.StatusOK, nil
 }

@@ -25,13 +25,6 @@ func (s *Session) snapshot() (accessToken, refreshToken string, expiresAt time.T
 	return s.AccessToken, s.RefreshToken, s.ExpiresAt
 }
 
-// expired reports whether the session can neither authorize nor be renewed.
-func (s *Session) expired(now time.Time) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.expiredLocked(now)
-}
-
 // expiredLocked reports whether the session can neither authorize nor be
 // renewed. The caller must hold the session lock. A session expires exactly at
 // its expiry timestamp, matching the OIDC exp claim, which is valid only while
