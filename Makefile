@@ -20,10 +20,34 @@ export VM_HOST VM_USER VM_PASS
 MODULES := . dev/helloworld
 GO_FILES := $(wildcard *.go) $(wildcard dev/helloworld/*.go)
 
-.PHONY: help fmt fmt-check vet lint test test-race cover tidy check up down restart logs ps smoke demo clean require-vm-env vm-venv vm-check vm-syntax vm-up vm-demo-per-app vm-demo-shared vm-sync vm-status vm-logs vm-down vm-uninstall-k3s vm-kubeconfig
+.PHONY: help tag-patch tag-minor tag-major fmt fmt-check vet lint test test-race cover tidy check up down restart logs ps smoke demo clean require-vm-env vm-venv vm-check vm-syntax vm-up vm-demo-per-app vm-demo-shared vm-sync vm-status vm-logs vm-down vm-uninstall-k3s vm-kubeconfig
 
 help: ## Show all available targets
 	@awk 'BEGIN { FS = "## " }; /^[a-zA-Z0-9_-]+:.*## / { split($$1, target, ":"); printf "  %-18s %s\n", target[1], $$2 }' $(MAKEFILE_LIST)
+
+tag-patch: ## Create and push the next patch tag
+tag-minor: ## Create and push the next minor tag
+tag-major: ## Create and push the next major tag
+
+tag-patch tag-minor tag-major: tag-%:
+	@set -e; \
+	latest="$$(git tag --list 'v*.*.*' --sort=-v:refname | head -n 1)"; \
+	if [ -z "$$latest" ]; then \
+		printf 'No existing semantic version tags found.\n' >&2; \
+		exit 1; \
+	fi; \
+	new="$$(printf '%s\n' "$$latest" | awk -F. -v bump="$*" '{ \
+		major = substr($$1, 2) + 0; \
+		minor = $$2 + 0; \
+		patch = $$3 + 0; \
+		if (bump == "major") { major++; minor = 0; patch = 0 } \
+		if (bump == "minor") { minor++; patch = 0 } \
+		if (bump == "patch") { patch++ } \
+		printf "v%d.%d.%d\n", major, minor, patch; \
+	}')"; \
+	printf 'Creating and pushing tag %s\n' "$$new"; \
+	git tag "$$new"; \
+	git push origin "$$new"
 
 fmt: ## Format Go files in both modules
 	$(GOFMT) -w $(GO_FILES)
