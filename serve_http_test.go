@@ -991,7 +991,15 @@ func TestGenericErrorsDoNotLeakBodies(t *testing.T) {
 	p.setToken(`{"error":"invalid_grant","error_description":"SECRET_LEAK_MARKER"}`)
 
 	rw := httptest.NewRecorder()
-	auth.ServeHTTP(rw, apiGet("https://app.test/dashboard"))
+	req := apiGet("https://app.test/dashboard")
+	req.AddCookie(&http.Cookie{Name: sessionCookieName(auth.clientKey), Value: "known"})
+	auth.ServeHTTP(rw, req)
+	if p.tokenRequestCount() != 1 {
+		t.Fatalf("token requests = %d, want 1 refresh attempt", p.tokenRequestCount())
+	}
+	if rw.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 after invalid_grant", rw.Code)
+	}
 	if strings.Contains(rw.Body.String(), "SECRET_LEAK_MARKER") {
 		t.Fatalf("response leaked upstream body: %q", rw.Body.String())
 	}

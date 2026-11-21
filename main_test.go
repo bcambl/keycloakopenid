@@ -236,6 +236,8 @@ func TestIsNavigationRequestTable(t *testing.T) {
 		{"no fetch metadata xhr", http.MethodGet, "", "text/html", true, false},
 		{"post navigation", http.MethodPost, "navigate", "text/html", false, false},
 		{"json accept", http.MethodGet, "", "application/json", false, false},
+		{"navigate with JSON accept", http.MethodGet, "navigate", "application/json", false, false},
+		{"navigate with XHR marker", http.MethodGet, "navigate", "text/html", true, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

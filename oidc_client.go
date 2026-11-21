@@ -551,7 +551,7 @@ func (c *oidcClient) introspect(ctx context.Context, accessToken string) (tokenS
 	switch {
 	case resp.StatusCode == http.StatusOK:
 		var r struct {
-			Active bool `json:"active"`
+			Active *bool `json:"active"`
 		}
 		decoder := json.NewDecoder(resp.Body)
 		if err := decoder.Decode(&r); err != nil {
@@ -561,7 +561,10 @@ func (c *oidcClient) introspect(ctx context.Context, accessToken string) (tokenS
 		if err := decoder.Decode(&extra); err != io.EOF {
 			return tokenUnavailable, newOIDCError(oidcErrMalformed, errors.New("oidc: malformed introspection response"))
 		}
-		if r.Active {
+		if r.Active == nil {
+			return tokenUnavailable, newOIDCError(oidcErrMalformed, errors.New("oidc: malformed introspection response"))
+		}
+		if *r.Active {
 			return tokenActive, nil
 		}
 		return tokenInactive, nil

@@ -32,17 +32,18 @@ func isNavigationRequest(req *http.Request) bool {
 	if req.Method != http.MethodGet {
 		return false
 	}
-	switch req.Header.Get("Sec-Fetch-Mode") {
-	case "navigate":
-		return true
-	case "":
-	default:
-		return false
-	}
 	if req.Header.Get("X-Requested-With") == "XMLHttpRequest" {
 		return false
 	}
-	return strings.Contains(req.Header.Get("Accept"), "text/html")
+	if !strings.Contains(req.Header.Get("Accept"), "text/html") {
+		return false
+	}
+	switch req.Header.Get("Sec-Fetch-Mode") {
+	case "navigate", "":
+		return true
+	default:
+		return false
+	}
 }
 
 // isIgnoredPath reports whether path is covered by a configured ignored prefix

@@ -1511,6 +1511,8 @@ func TestIntrospectStatuses(t *testing.T) {
 	}{
 		{"active", http.StatusOK, `{"active":true}`, tokenActive, -1},
 		{"inactive", http.StatusOK, `{"active":false}`, tokenInactive, -1},
+		{"missing active", http.StatusOK, `{}`, tokenUnavailable, oidcErrMalformed},
+		{"null active", http.StatusOK, `{"active":null}`, tokenUnavailable, oidcErrMalformed},
 		{"refusal", http.StatusUnauthorized, `{"error":"invalid_client"}`, tokenUnavailable, oidcErrRefusal},
 		{"outage", http.StatusInternalServerError, `oops`, tokenUnavailable, oidcErrOutage},
 		{"malformed", http.StatusOK, `not json`, tokenUnavailable, oidcErrMalformed},
