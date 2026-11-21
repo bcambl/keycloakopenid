@@ -19,32 +19,11 @@ spec:
       UseAuthHeader: true
       CallbackURL: https://{{ vm_host }}{{ client.callback }}
       IgnorePathPrefixes: {{ helloworld_apps | map(attribute='name') | map('regex_replace', '^(.*)$', '/\\1/favicon.ico,/\\1/healthz') | join(',') }}
----
-# A single router (and therefore a single plugin instance and session store)
-# authenticates every app path, then hands the request to Traefik's own
-# cluster-internal entrypoint, where per-path routers strip the prefix.
-apiVersion: traefik.io/v1alpha1
-kind: IngressRoute
-metadata:
-  name: helloworld-shared-auth
-  namespace: {{ demo_namespace }}
-  labels:
-    app.kubernetes.io/part-of: keycloakopenid-demo
-    demo-mode: shared
-spec:
-  entryPoints:
-    - websecure
-  routes:
-    - kind: Rule
-      match: {{ helloworld_apps | map(attribute='name') | map('regex_replace', '^(.*)$', 'PathPrefix(`/\\1`)') | join(' || ') }} || PathPrefix(`/callback`)
-      middlewares:
-        - name: shared-auth
-      services:
-        - name: traefik-internal
-          namespace: kube-system
-          port: {{ traefik_internal_port }}
-  tls:
-    secretName: demo-tls
+
+# Two routers share one client. Traefik creates a plugin instance per router,
+# but every instance configured with the same Keycloak URL, realm and client ID
+# shares one process-wide session store and one host-only cookie, so a login on
+# either path authenticates both.
 {% for app in helloworld_apps %}
 ---
 apiVersion: traefik.io/v1alpha1
@@ -64,21 +43,31 @@ spec:
 apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
 metadata:
-  name: helloworld-shared-internal
+  name: helloworld-shared
   namespace: {{ demo_namespace }}
   labels:
     app.kubernetes.io/part-of: keycloakopenid-demo
     demo-mode: shared
 spec:
   entryPoints:
-    - internal
+    - websecure
   routes:
+    - kind: Rule
+      match: PathPrefix(`/callback`)
+      middlewares:
+        - name: shared-auth
+      services:
+        - name: helloworld1
+          port: 80
 {% for app in helloworld_apps %}
     - kind: Rule
       match: PathPrefix(`/{{ app.name }}`)
       middlewares:
+        - name: shared-auth
         - name: {{ app.name }}-shared-strip
       services:
         - name: {{ app.name }}
           port: 80
 {% endfor %}
+  tls:
+    secretName: demo-tls

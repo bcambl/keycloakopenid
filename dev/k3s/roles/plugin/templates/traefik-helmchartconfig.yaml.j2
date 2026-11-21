@@ -9,23 +9,9 @@ spec:
       web:
         redirectTo:
           port: websecure
-      internal:
-        port: {{ traefik_internal_port }}
-        exposedPort: {{ traefik_internal_port }}
-        expose:
-          default: false
-          internal: true
-        protocol: TCP
     providers:
       kubernetesCRD:
         allowCrossNamespace: true
-    service:
-      additionalServices:
-        internal:
-          spec:
-            type: ClusterIP
-          labels:
-            traefik-service-label: internal
 {% if vm_host is not match('^[0-9.]+$') %}
     deployment:
       hostAliases:
