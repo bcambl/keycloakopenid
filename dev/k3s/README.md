@@ -107,7 +107,7 @@ Edit the plugin in your checkout, then push the source to the VM's Traefik:
 make vm-sync
 ```
 
-This copies the plugin's `*.go`, `go.mod` and `.traefik.yml` to `/opt/keycloakopenid/src/github.com/bcambl/keycloakopenid` on the VM. The k3s Traefik chart mounts that directory as a local plugin (`experimental.localPlugins` with `type: hostPath`). The target then restarts Traefik so it reloads the interpreted plugin. Run `make vm-demo-per-app` or `make vm-demo-shared` afterwards to re-test.
+This copies the plugin's `*.go`, `go.mod`, `go.sum`, `.traefik.yml`, and `vendor/` directory to `/opt/keycloakopenid/src/github.com/bcambl/keycloakopenid` on the VM. The k3s Traefik chart mounts that directory as a local plugin (`experimental.localPlugins` with `type: hostPath`). The target then restarts Traefik so it reloads the interpreted plugin. Run `make vm-demo-per-app` or `make vm-demo-shared` afterwards to re-test.
 
 ## All VM targets
 

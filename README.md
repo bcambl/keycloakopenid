@@ -53,7 +53,7 @@ Or from environment variables:
 |---|---|---|
 | `KeycloakURL` | - | Keycloak base URL. A complete URL or a bare host is accepted. Required. |
 | `ClientID` | - | OIDC client ID. Required. |
-| `ClientSecret` | - | OIDC client secret. Required for the confidential-client flow. |
+| `ClientSecret` | - | OIDC client secret. Required for the confidential-client code exchange, refresh, and introspection. |
 | `KeycloakRealm` | - | Keycloak realm. Required. |
 | `CallbackURL` | - | Fixed callback URL the browser returns to. Must be registered exactly as a redirect URI on the Keycloak client. Required. |
 | `Scope` | `openid` | Space-delimited scopes. `openid` is always added. |
@@ -74,7 +74,7 @@ Or from environment variables:
 
 ### ID-token requirements
 
-The plugin validates the ID token returned by Keycloak: its signature, issuer, audience, authorized party (`azp` when the token has multiple audiences), expiry, and access-token hash (`at_hash`), plus the `nonce` echoed from the login. The token response must include both an `access_token` and a `refresh_token`. The claim named by `UserClaimName` (default `preferred_username`) must be present and a non-empty string; otherwise the plugin fails closed and does not call the next handler. A refresh that changes the ID token's `subject` is rejected.
+The plugin validates the ID token returned by Keycloak: its signature, issuer, audience, authorized party (`azp` when the token has multiple audiences), required expiry and issued-at (`iat`) claims, and access-token hash (`at_hash`), plus the `nonce` echoed from the login. The token response must include an `access_token`, a `refresh_token`, and a positive `expires_in` lifetime. The claim named by `UserClaimName` (default `preferred_username`) must be present and a non-empty string; otherwise the plugin fails closed and does not call the next handler. A refreshed ID token must retain the original subject and audience set. Its nonce may be omitted, but must match the original login nonce when present.
 
 ### Header handling
 
@@ -88,7 +88,7 @@ Sessions are held in memory, inside the Traefik process. They are keyed by the n
 - A Traefik restart or replica replacement loses every session; users sign in again.
 - Each per-client store is process-lifetime state, bounded by `SessionCapacity` with least-recently-used eviction.
 - A session ends when Keycloak refuses a refresh (`invalid_grant`); navigation is redirected to Keycloak and API requests receive `401`.
-- A Keycloak outage never ends a session: introspection or renewal transport failures answer `502` and leave the session intact.
+- Introspection failures answer `502` and leave the session intact. A renewal failure for an active token may let the request proceed with its current access token. A renewal outage for an inactive token, where renewal is forced, answers `502`. Neither outcome deletes the stored session.
 
 ## Authorization is the application's job
 
@@ -96,6 +96,7 @@ This middleware authenticates and identifies the user. It does not authorize. `X
 
 ## Migration from earlier versions
 
+- Upgrading invalidates sessions issued by earlier versions, so users must sign in again. Incoming identity headers and `Authorization` are stripped before routing, including on ignored paths.
 - `TokenCookieName` / `AUTH_TOKEN` are removed. The plugin issues one host-only `__Host-` session cookie whose name is derived from the client; it is not configurable.
 - The authorization-cookie behavior is removed. `UseAuthHeader` controls whether the bearer token is forwarded in the `Authorization` header.
 - The client-credentials grant is removed. Authentication always uses the authorization-code flow.
