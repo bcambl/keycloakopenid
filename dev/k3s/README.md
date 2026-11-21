@@ -82,15 +82,15 @@ Host-based routing, as in the local Podman stack, behaves the same way, because 
 
 ### Shared multi-app client (`make vm-demo-shared`)
 
-One Keycloak client (`helloworld-shared`, with a single redirect URI for its callback) protects both paths. Two routers each reference the same `shared-auth` middleware, and a third route serves the fixed callback:
+One Keycloak client (`helloworld-shared`, with a single redirect URI for its callback) protects both paths. Two routers each reference their own middleware, both configured with the same client, and a third route serves the fixed callback:
 
 ```
-websecure ─ /helloworld1 → shared-auth → strip /helloworld1 → helloworld1
-          └ /helloworld2 → shared-auth → strip /helloworld2 → helloworld2
-          └ /callback    → shared-auth (intercepted)
+websecure ─ /helloworld1 → helloworld1-shared-auth → strip /helloworld1 → helloworld1
+          └ /helloworld2 → helloworld2-shared-auth → strip /helloworld2 → helloworld2
+          └ /callback    → helloworld1-shared-auth (intercepted)
 ```
 
-Traefik creates a plugin instance per router, but both app routers use the same client, so they share one session store and one `__Host-` cookie. After one login, both paths accept the same cookie with no further Keycloak redirects.
+Traefik creates a plugin instance per middleware, so the two app routers are separate plugin instances. Because both middlewares use the same Keycloak client, they still share one process-wide session store and one `__Host-` cookie. After one login, both paths accept the same cookie with no further Keycloak redirects; the smoke test logs in through helloworld1's middleware and then authenticates helloworld2 with the resulting cookie, proving the store is shared across instances.
 
 ### Details that apply to both modes
 

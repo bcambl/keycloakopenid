@@ -279,7 +279,7 @@ class Demo:
         print("helloworld1 receives Alice and the bearer token")
         self.expect_app("helloworld2", session)
         self.expect_app("helloworld1", session)
-        print("One session cookie authenticates both paths through two routers sharing one client")
+        print("One session cookie authenticates both paths across two separate middlewares sharing one client")
 
         self.check_header_sanitization("helloworld1", session)
         self.check_invalid_session(session.partition("=")[0])
