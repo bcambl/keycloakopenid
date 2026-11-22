@@ -4,7 +4,6 @@ vm_host_san: "{{ ('IP:' ~ vm_host) if vm_host is match('^[0-9.]+$') else ('DNS:'
 k3s_version: v1.37.2+k3s1
 demo_namespace: demo
 demo_mode: per-app
-traefik_internal_port: 8001
 plugin_source_path: /opt/keycloakopenid/src/github.com/bcambl/keycloakopenid
 plugin_module_name: github.com/bcambl/keycloakopenid
 plugin_mount_path: /plugins-local/src/github.com/bcambl/keycloakopenid
@@ -15,12 +14,15 @@ keycloak_clients:
   - id: helloworld1
     secret: helloworld1-dev-secret
     paths: [/helloworld1]
+    callback: /helloworld1/callback
   - id: helloworld2
     secret: helloworld2-dev-secret
     paths: [/helloworld2]
+    callback: /helloworld2/callback
   - id: helloworld-shared
     secret: helloworld-shared-dev-secret
     paths: [/helloworld1, /helloworld2]
+    callback: /callback
 helloworld_image: localhost/helloworld:dev
 helloworld_apps:
   - name: helloworld1

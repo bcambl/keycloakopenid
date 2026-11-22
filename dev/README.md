@@ -18,22 +18,24 @@ make up
 
 Run `make help` to list all available development, Go check, and stack-management targets. The default `COMPOSE` command is `podman compose -f podman-compose.yml`; override `COMPOSE` if your Podman Compose provider needs a different invocation.
 
-Keycloak imports `dev/keycloak/demo-realm.json` when its data directory is empty. Wait for Keycloak and Traefik to finish starting before opening the apps:
+Keycloak imports `dev/keycloak/demo-realm.json` when its data directory is empty. After changing realm settings, recreate the Keycloak container so the realm is imported again (`make down && make demo`); the smoke test verifies the running realm's access-token lifetime and reports an actionable error when a pre-existing container still carries the old settings. Wait for Keycloak and Traefik to finish starting before opening the apps:
 
 - [helloworld1](http://helloworld1.localhost:8000)
 - [helloworld2](http://helloworld2.localhost:8000)
 - [Keycloak admin console](http://127.0.0.1:8081/admin/) — `demo-admin` / `demo-admin-password`
 - [Traefik dashboard](http://127.0.0.1:8090/dashboard/)
 
-Sign in to either app with `alice` / `alice-password` or `bob` / `bob-password`. After signing in once, follow the link to the other app to see Keycloak single sign-on. Each app has its own client and plugin session store. `*.localhost` maps to the local machine in modern browsers; the configured Secure session cookie can be used on these HTTP loopback origins.
+Sign in to either app with `alice` / `alice-password` or `bob` / `bob-password`. After signing in once, follow the link to the other app to see Keycloak single sign-on. Each app has its own client, so each gets its own host-only `__Host-` session cookie and its own per-client store. `*.localhost` maps to the local machine in modern browsers, so the Secure session cookie can be used on these HTTP loopback origins.
 
 ## Test
 
-Run the end-to-end flow, including login, token exchange, the user and bearer headers, SSO to the second app, invalid-session rejection, and the ignored health path:
+Run the end-to-end flow, including login, the fixed callback and return-path restoration, the user and bearer headers, SSO to the second app, header sanitization on protected and ignored paths, invalid-session rejection, and the ignored health path:
 
 ```sh
 make smoke
 ```
+
+The smoke test also verifies the token lifecycle. The demo realm issues 10-second access tokens and the middleware refreshes 2 seconds before expiry. After an initial protected read, the test waits 11 seconds, requires the same plugin session to be accepted, and requires a changed access-token `jti` in the decoded claims, proving a real renewal. It then obtains a master-realm administrator token through `admin-cli`, finds Alice, revokes every Keycloak session through the Admin REST API, and requires the next protected request with the old plugin cookie to redirect to login and expire the session cookie. Revocation ends the browser's Keycloak SSO session, so this check runs last. The administrator credentials and endpoints are for the demo environment only.
 
 The test uses Python's standard library and does not require external packages. Run the Go checks for both modules with:
 
@@ -67,4 +69,4 @@ make down
 
 Keycloak's imported realm is not persisted across container removal. If a browser has an old session, sign out or clear cookies for the two `*.localhost` apps and `127.0.0.1:8081` before retrying. Check startup output with `make logs`. The services use loopback ports 8000, 8081, 8090, 9001, and 9002; if those ports are already in use, update the corresponding bindings and URLs in `podman-compose.yml`, `dev/traefik/traefik.yml`, `dev/traefik/dynamic.yml`, and the realm redirect URIs.
 
-This environment intentionally demonstrates the existing middleware, not production-hardening. Known limitations include substring-based matching in `IgnorePathPrefixes` (a path containing an ignored string can bypass auth), the `iss` parameter remaining on the callback redirect, mutation of `http.DefaultTransport` during code exchange, and an unchecked type assertion of Keycloak's introspection `active` value. The existing `main_test.go` also constructs a request with an external hostname without asserting useful response behavior. The example app only decodes token claims for display and does not validate them; it must not be used as an authorization example.
+This environment demonstrates the middleware on an isolated loopback stack, not production hardening. The plugin strips incoming `X-Forwarded-User` and `Authorization` on every request and issues a host-only `__Host-` session cookie; sessions are process-local, so a single Traefik instance is required and a restart signs everyone out. The example app only decodes token claims for display and does not validate them or enforce authorization; it must not be used as an authorization example.

@@ -2,6 +2,8 @@
 """Exercise the k3s path-based demo: Keycloak at /auth, apps at /helloworld1 and /helloworld2."""
 
 import argparse
+import html
+import json
 import os
 import re
 import ssl
@@ -17,6 +19,12 @@ APPS = ("helloworld1", "helloworld2")
 CLIENT_IDS = {
     "per-app": {"helloworld1": "helloworld1", "helloworld2": "helloworld2"},
     "shared": {"helloworld1": "helloworld-shared", "helloworld2": "helloworld-shared"},
+}
+# Each client registers one fixed callback. The plugin sends this exact URI as
+# redirect_uri regardless of the requested path, then restores the path.
+CALLBACK_PATHS = {
+    "per-app": {"helloworld1": "/helloworld1/callback", "helloworld2": "/helloworld2/callback"},
+    "shared": {"helloworld1": "/callback", "helloworld2": "/callback"},
 }
 
 
@@ -44,13 +52,16 @@ opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context
 keycloak_cookies = {}
 
 
-def request(url, data=None, headers=None):
+def request(url, data=None, headers=None, method=None):
     headers = dict(headers or {})
     if not urllib.parse.urlsplit(url).path.startswith("/auth/"):
         headers.setdefault("Accept", "text/html")
         headers.setdefault("Sec-Fetch-Mode", "navigate")
     try:
-        return opener.open(urllib.request.Request(url, data=data, headers=headers), timeout=20)
+        return opener.open(
+            urllib.request.Request(url, data=data, headers=headers, method=method),
+            timeout=20,
+        )
     except urllib.error.HTTPError as response:
         return response
 
@@ -67,9 +78,46 @@ def keycloak_cookie_header():
 
 
 def session_cookie(response):
+    """Return the host-only session cookie (name=value) set on response, or "".
+
+    The plugin sets a __Host- session cookie with no Max-Age attribute. During a
+    callback it also clears the per-login cookie, which carries Max-Age, so it is
+    skipped here.
+    """
     for header in response.headers.get_all("Set-Cookie", []):
-        if header.startswith("SessionID=") and not header.startswith("SessionID=;"):
+        if not header.startswith("__Host-") or "Max-Age=" in header:
+            continue
+        pair = header.split(";", 1)[0]
+        name, _, value = pair.partition("=")
+        if name and value:
             return header
+    return ""
+
+
+def session_cookie_pair(response):
+    cookie = session_cookie(response)
+    return cookie.split(";", 1)[0] if cookie else ""
+
+
+def login_cookie_pair(response):
+    """Return the browser-bound login cookie (name=value) set on response, or "".
+
+    The plugin issues a __Host- login cookie carrying a positive Max-Age on the
+    initial redirect to Keycloak; the callback must echo that cookie back so the
+    plugin can match the callback to its pending transaction. Session cookies
+    carry no Max-Age and clearing cookies carry Max-Age=0/-1, so both are
+    skipped here.
+    """
+    for header in response.headers.get_all("Set-Cookie", []):
+        if not header.startswith("__Host-"):
+            continue
+        max_age = re.search(r"Max-Age=(-?\d+)", header)
+        if not max_age or int(max_age.group(1)) <= 0:
+            continue
+        pair = header.split(";", 1)[0]
+        name, _, value = pair.partition("=")
+        if name and value:
+            return pair
     return ""
 
 
@@ -82,6 +130,110 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+CLAIMS_BLOCK = re.compile(
+    r"Decoded token claims \(display only; not verified\)</h2>\s*<pre>(.*?)</pre>",
+    re.DOTALL,
+)
+
+
+def access_token_jti(body):
+    match = CLAIMS_BLOCK.search(body)
+    require(match is not None, "page did not include decoded token claims")
+    try:
+        claims = json.loads(html.unescape(match.group(1)))
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"decoded token claims were not valid JSON: {error}") from error
+    jti = claims.get("jti")
+    require(isinstance(jti, str) and jti, "access token claims did not include a nonempty jti")
+    return jti
+
+
+def session_cookie_expired(response, name):
+    for header in response.headers.get_all("Set-Cookie", []):
+        if not header.startswith(name + "="):
+            continue
+        max_age = re.search(r"Max-Age=(-?\d+)", header)
+        if max_age and int(max_age.group(1)) <= 0:
+            return True
+    return False
+
+
+def admin_access_token(keycloak_base):
+    credentials = urllib.parse.urlencode(
+        {
+            "grant_type": "password",
+            "client_id": "admin-cli",
+            "username": "demo-admin",
+            "password": "demo-admin-password",
+        }
+    ).encode()
+    response = request(
+        keycloak_base + "/realms/master/protocol/openid-connect/token",
+        data=credentials,
+    )
+    require(response.status == 200, f"admin token request returned {response.status}")
+    admin = json.loads(response.read().decode())
+    token = admin.get("access_token")
+    require(isinstance(token, str) and token, "admin token response did not include access_token")
+    return token
+
+
+def realm_access_token_lifespan(keycloak_base):
+    token = admin_access_token(keycloak_base)
+    response = request(
+        keycloak_base + "/admin/realms/demo",
+        headers={"Authorization": "Bearer " + token},
+    )
+    require(response.status == 200, f"realm lookup returned {response.status}")
+    realm = json.loads(response.read().decode())
+    lifespan = realm.get("accessTokenLifespan")
+    require(isinstance(lifespan, int) and lifespan > 0, "realm has no valid accessTokenLifespan")
+    require(
+        lifespan == 10,
+        f"demo realm accessTokenLifespan is {lifespan}, not 10; recreate Keycloak so the realm is re-imported",
+    )
+    return lifespan
+
+
+def revoke_alice_sessions(keycloak_base):
+    token = admin_access_token(keycloak_base)
+    authorization = {"Authorization": "Bearer " + token}
+
+    response = request(
+        keycloak_base
+        + "/admin/realms/demo/users?"
+        + urllib.parse.urlencode({"username": "alice"}),
+        headers=authorization,
+    )
+    require(response.status == 200, f"Alice lookup returned {response.status}")
+    users = json.loads(response.read().decode())
+    require(isinstance(users, list), "Alice lookup did not return a list")
+    alice = next((user for user in users if user.get("username") == "alice"), None)
+    require(alice is not None, "Alice was not found in the demo realm")
+    user_id = alice.get("id")
+    require(isinstance(user_id, str) and user_id, "Alice has no user id")
+
+    response = request(
+        keycloak_base + "/admin/realms/demo/users/" + urllib.parse.quote(user_id) + "/sessions",
+        headers=authorization,
+    )
+    require(response.status == 200, f"Alice session lookup returned {response.status}")
+    sessions = json.loads(response.read().decode())
+    require(isinstance(sessions, list), "Alice session lookup did not return a list")
+    require(sessions, "Alice had no Keycloak sessions to revoke")
+    for session in sessions:
+        session_id = session.get("id")
+        require(isinstance(session_id, str) and session_id, "Keycloak session has no id")
+        response = request(
+            keycloak_base
+            + "/admin/realms/demo/sessions/"
+            + urllib.parse.quote(session_id, safe=""),
+            headers=authorization,
+            method="DELETE",
+        )
+        require(response.status in (200, 204), f"session delete returned {response.status}")
+
+
 class Demo:
     def __init__(self, host, mode):
         self.base = f"https://{host}"
@@ -90,7 +242,10 @@ class Demo:
     def url(self, path):
         return self.base + path
 
-    def expect_keycloak_redirect(self, response, app, path_prefix):
+    def callback_url(self, app):
+        return self.base + CALLBACK_PATHS[self.mode][app]
+
+    def expect_keycloak_redirect(self, response, app):
         require(response.status == 303, f"{app} should redirect to Keycloak; got {response.status}")
         location = response.headers["Location"]
         require(location.startswith(self.url("/auth/realms/demo/")),
@@ -99,9 +254,8 @@ class Demo:
         expected_client = CLIENT_IDS[self.mode][app]
         require(query.get("client_id") == [expected_client],
                 f"{app} used client {query.get('client_id')}, expected {expected_client}")
-        redirect_uri = query.get("redirect_uri", [""])[0]
-        require(redirect_uri.startswith(self.url(path_prefix)),
-                f"redirect_uri lost the path prefix (auth must run before StripPrefix): {redirect_uri}")
+        require(query.get("redirect_uri") == [self.callback_url(app)],
+                f"{app} redirect_uri was not its fixed registered callback: {query.get('redirect_uri')}")
         return location
 
     def wait_until_ready(self):
@@ -133,9 +287,12 @@ class Demo:
         print("Health paths bypass authentication on both apps")
 
     def login(self, app):
-        response = request(self.url(f"/{app}/protected?from=smoke"))
-        authorization_url = self.expect_keycloak_redirect(response, app, f"/{app}/protected")
-        print(f"Unauthenticated /{app} request redirects to Keycloak with the path prefix intact")
+        target = f"/{app}/protected?from=smoke"
+        response = request(self.url(target))
+        login_cookie = login_cookie_pair(response)
+        require(login_cookie, f"/{app} did not issue a browser-bound login cookie")
+        authorization_url = self.expect_keycloak_redirect(response, app)
+        print(f"Unauthenticated /{app} request redirects to Keycloak with the fixed callback")
 
         response = request(authorization_url)
         require(response.status == 200, f"Keycloak login page returned {response.status}")
@@ -151,28 +308,39 @@ class Demo:
         record_keycloak_cookies(response)
         require(response.status in (302, 303), f"login failed with HTTP {response.status}")
         print("Alice signs in to Keycloak")
-        return self.finish_callback(response.headers["Location"], app)
+        return self.finish_callback(response.headers["Location"], app, target, login_cookie)
 
-    def sso(self, app, cookie_header):
-        response = request(self.url(f"/{app}/protected"), headers={"Cookie": cookie_header})
-        authorization_url = self.expect_keycloak_redirect(response, app, f"/{app}/protected")
+    def sso(self, app):
+        target = f"/{app}/protected"
+        response = request(self.url(target))
+        login_cookie = login_cookie_pair(response)
+        require(login_cookie, f"/{app} did not issue a browser-bound login cookie")
+        authorization_url = self.expect_keycloak_redirect(response, app)
         response = request(authorization_url, headers={"Cookie": keycloak_cookie_header()})
         record_keycloak_cookies(response)
         require(response.status in (302, 303),
                 f"existing Keycloak login did not complete SSO for {app}; got HTTP {response.status}")
-        return self.finish_callback(response.headers["Location"], app)
+        return self.finish_callback(response.headers["Location"], app, target, login_cookie)
 
-    def finish_callback(self, callback, app):
-        require(callback.startswith(self.url(f"/{app}/")), f"Keycloak did not return to /{app}: {callback}")
-        response = request(callback)
+    def finish_callback(self, callback, app, target, login_cookie):
+        require(callback.startswith(self.callback_url(app) + "?"),
+                f"Keycloak did not return to the fixed callback {self.callback_url(app)}: {callback}")
+        response = request(callback, headers={"Cookie": login_cookie})
         require(response.status == 303, f"{app} callback returned {response.status}")
         cookie = session_cookie(response)
+        require(cookie, f"{app} did not issue a host-only __Host- session cookie")
         require("Secure" in cookie and "HttpOnly" in cookie and "Path=/" in cookie,
-                f"{app} did not issue a Secure, HttpOnly SessionID cookie with Path=/")
+                f"{app} did not issue a Secure, HttpOnly session cookie with Path=/")
         destination = response.headers["Location"]
         query = query_of(destination)
         require("code" not in query and "state" not in query, "authorization parameters were not removed")
-        session = cookie.split(";", 1)[0]
+        expected = urllib.parse.urlsplit(self.url(target))
+        actual = urllib.parse.urlsplit(destination)
+        require(actual.path == expected.path,
+                f"callback did not restore the original path {expected.path}: {destination}")
+        require(actual.query == expected.query,
+                f"callback did not restore the original query {expected.query!r}: {destination}")
+        session = session_cookie_pair(response)
         self.expect_app(app, session)
         return session
 
@@ -185,36 +353,99 @@ class Demo:
         require("Bearer token forwarded: true" in body, f"{app} did not receive the bearer token")
         require(session_cookie(response) == "", f"{app} unexpectedly replaced the session cookie")
 
-    def check_invalid_session(self):
-        for app in APPS:
-            response = request(self.url(f"/{app}/protected"), headers={"Cookie": "SessionID=invalid"})
-            self.expect_keycloak_redirect(response, app, f"/{app}/protected")
-        print("An invalid SessionID redirects to Keycloak on both apps")
+    def check_header_sanitization(self, app, session):
+        response = request(
+            self.url(f"/{app}/protected"),
+            headers={
+                "Cookie": session,
+                "X-Forwarded-User": "attacker",
+                "Authorization": "Bearer attacker-token",
+            },
+        )
+        body = response.read().decode()
+        require(response.status == 200, f"/{app}/protected with session returned {response.status}")
+        require("Authenticated user: <strong>alice</strong>" in body,
+                f"/{app} did not strip and replace hostile X-Forwarded-User")
+        require("Bearer token forwarded: true" in body, f"/{app} did not strip hostile Authorization")
+        require("Unable to decode token" not in body,
+                f"/{app} forwarded the hostile bearer token instead of the validated one")
+
+        response = request(
+            self.url(f"/{app}/favicon.ico"),
+            headers={"X-Forwarded-User": "attacker", "Authorization": "Bearer attacker-token"},
+        )
+        body = response.read().decode()
+        require(response.status == 200, f"/{app}/favicon.ico returned {response.status}")
+        require("Authenticated user: <strong>not provided</strong>" in body,
+                f"/{app} ignored path did not strip X-Forwarded-User")
+        require("Bearer token forwarded: false" in body,
+                f"/{app} ignored path did not strip Authorization")
+        print(f"Hostile X-Forwarded-User and Authorization are stripped on /{app} protected and ignored paths")
+
+    def check_invalid_session(self, name):
+        response = request(self.url("/helloworld1/protected"),
+                           headers={"Cookie": f"{name}=invalid"})
+        self.expect_keycloak_redirect(response, "helloworld1")
+        print("An invalid session cookie redirects to Keycloak")
+
+    def check_token_lifecycle(self, session):
+        realm_access_token_lifespan(self.base + "/auth")
+        protected = self.url("/helloworld1/protected")
+        response = request(protected, headers={"Cookie": session})
+        body = response.read().decode()
+        require(response.status == 200, f"lifecycle read returned {response.status}")
+        first_jti = access_token_jti(body)
+
+        time.sleep(11)
+        response = request(protected, headers={"Cookie": session})
+        body = response.read().decode()
+        require(response.status == 200, f"renewed read returned {response.status}")
+        second_jti = access_token_jti(body)
+        require(first_jti != second_jti, "access token was not renewed after its lifetime elapsed")
+        print("Access token renewed with a changed jti after its lifetime elapsed")
+
+        revoke_alice_sessions(self.base + "/auth")
+        print("Alice's demo Keycloak sessions were revoked through the Admin REST API")
+
+        time.sleep(11)
+        name = session.partition("=")[0]
+        response = request(protected, headers={"Cookie": session})
+        require(response.status == 303, f"revoked session should redirect; got {response.status}")
+        require(session_cookie_expired(response, name), "revoked session cookie was not expired")
+        print("Revoked session redirects to a fresh login and expires the session cookie")
 
     def run_per_app(self):
         first = self.login("helloworld1")
         print("helloworld1 receives Alice and the bearer token")
+        first_name = first.partition("=")[0]
 
-        # The browser sends helloworld1's cookie (Path=/) to helloworld2, whose Keycloak
-        # client has its own session store and does not recognise it.
-        second = self.sso("helloworld2", first)
-        require(second != first, "helloworld2 should issue a different SessionID")
-        print("helloworld2 completes SSO without a password and overwrites SessionID (Path=/)")
+        second = self.sso("helloworld2")
+        second_name = second.partition("=")[0]
+        require(first_name != second_name,
+                "distinct clients must issue distinct __Host- cookie names")
+        print("helloworld2 completes SSO without a password and issues its own __Host- cookie")
+
+        self.expect_app("helloworld1", first)
+        print("helloworld1's session survives helloworld2's login (distinct-client cookie isolation)")
 
         response = request(self.url("/helloworld1/protected"), headers={"Cookie": second})
-        self.expect_keycloak_redirect(response, "helloworld1", "/helloworld1/protected")
-        print("COLLISION: returning to helloworld1 with helloworld2's SessionID forces another "
-              "Keycloak round-trip")
+        self.expect_keycloak_redirect(response, "helloworld1")
+        print("helloworld2's cookie is unknown to helloworld1 and forces a fresh login")
 
-        self.sso("helloworld1", second)
-        print("The repeat round-trip is silent (SSO), but it happens on every switch between apps")
+        self.check_header_sanitization("helloworld1", first)
+        self.check_invalid_session(first_name)
+        self.check_token_lifecycle(first)
 
     def run_shared(self):
         session = self.login("helloworld1")
         print("helloworld1 receives Alice and the bearer token")
         self.expect_app("helloworld2", session)
         self.expect_app("helloworld1", session)
-        print("One SessionID authenticates both paths with no further Keycloak redirects")
+        print("One session cookie authenticates both paths across two separate middlewares sharing one client")
+
+        self.check_header_sanitization("helloworld1", session)
+        self.check_invalid_session(session.partition("=")[0])
+        self.check_token_lifecycle(session)
 
     def run(self):
         self.wait_until_ready()
@@ -223,7 +454,6 @@ class Demo:
             self.run_per_app()
         else:
             self.run_shared()
-        self.check_invalid_session()
         print(f"{self.mode} smoke test passed")
 
 

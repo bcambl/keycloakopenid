@@ -1,12 +1,12 @@
 package keycloakopenid
 
 import (
+	"context"
 	"crypto/rand"
-	"crypto/tls"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -22,40 +22,71 @@ func generateSessionID() (string, error) {
 	return base64.URLEncoding.EncodeToString(randomBytes), nil
 }
 
-func (k *keycloakAuth) clearSessionCookie(rw http.ResponseWriter) {
-	expiration := time.Now().Add(-24 * time.Hour)
-	newCookie := &http.Cookie{
-		Name:    "SessionID",
-		Value:   "",
-		Path:    "/",
-		Expires: expiration,
-		MaxAge:  -1,
-	}
-	http.SetCookie(rw, newCookie)
+// pkceChallenge derives the S256 PKCE code challenge for a verifier.
+func pkceChallenge(verifier string) string {
+	sum := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
 func isNavigationRequest(req *http.Request) bool {
 	if req.Method != http.MethodGet {
 		return false
 	}
-	switch req.Header.Get("Sec-Fetch-Mode") {
-	case "navigate":
-		return true
-	case "":
-	default:
-		return false
-	}
 	if req.Header.Get("X-Requested-With") == "XMLHttpRequest" {
 		return false
 	}
-	return strings.Contains(req.Header.Get("Accept"), "text/html")
+	if !strings.Contains(req.Header.Get("Accept"), "text/html") {
+		return false
+	}
+	mode := req.Header.Get("Sec-Fetch-Mode")
+	return mode == "" || mode == "navigate"
 }
 
-func (k *keycloakAuth) redirectStatus() int {
-	if k.SilentRenewal {
-		return http.StatusSeeOther
+// isIgnoredPath reports whether path is covered by a configured ignored prefix
+// using path-segment matching: a prefix matches the exact path or a path that
+// begins with the prefix followed by a slash.
+func (k *keycloakAuth) isIgnoredPath(path string) bool {
+	for _, prefix := range k.IgnorePathPrefixes {
+		if prefix == "/" {
+			return true
+		}
+		prefix = strings.TrimRight(prefix, "/")
+		if prefix == "" {
+			continue
+		}
+		if path == prefix || strings.HasPrefix(path, prefix+"/") {
+			return true
+		}
 	}
-	return http.StatusTemporaryRedirect
+	return false
+}
+
+func (k *keycloakAuth) isCallbackPath(path string) bool {
+	return k.CallbackURL != nil && path == k.CallbackURL.Path
+}
+
+func validRequestPath(u *url.URL) bool {
+	if u == nil {
+		return false
+	}
+	rawPath := u.RawPath
+	if rawPath == "" {
+		rawPath = u.EscapedPath()
+	}
+	lowerPath := strings.ToLower(rawPath)
+	if strings.Contains(lowerPath, "%2f") || strings.Contains(lowerPath, "%5c") || strings.Contains(lowerPath, "%00") {
+		return false
+	}
+	decodedPath, err := url.PathUnescape(rawPath)
+	if err != nil || unsafeReturnTarget(rawPath) || unsafeReturnTarget(decodedPath) {
+		return false
+	}
+	for _, segment := range strings.Split(decodedPath, "/") {
+		if segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 func (k *keycloakAuth) writeUnauthorized(rw http.ResponseWriter) {
@@ -65,405 +96,278 @@ func (k *keycloakAuth) writeUnauthorized(rw http.ResponseWriter) {
 	_, _ = io.WriteString(rw, `{"error":"authentication_required"}`+"\n")
 }
 
+func (k *keycloakAuth) writeBadRequest(rw http.ResponseWriter) {
+	rw.Header().Set("Cache-Control", "no-store")
+	http.Error(rw, "invalid authentication request", http.StatusBadRequest)
+}
+
+func (k *keycloakAuth) writeUnavailable(rw http.ResponseWriter) {
+	rw.Header().Set("Cache-Control", "no-store")
+	http.Error(rw, "authentication service unavailable", http.StatusBadGateway)
+}
+
 func (k *keycloakAuth) requireAuthentication(rw http.ResponseWriter, req *http.Request) {
-	if k.SilentRenewal && !isNavigationRequest(req) {
+	if !isNavigationRequest(req) {
 		k.writeUnauthorized(rw)
 		return
 	}
-	k.redirectToKeycloak(rw, req)
+	k.startLogin(rw, req)
 }
 
-func (k *keycloakAuth) terminateSession(rw http.ResponseWriter, req *http.Request) {
-	if cookie, err := req.Cookie("SessionID"); err == nil {
-		k.SessionStore.Delete(cookie.Value)
-	}
-	k.clearSessionCookie(rw)
+// terminateSession ends an authenticated session: it deletes it from the store,
+// clears the session cookie, and requires the client to authenticate again.
+func (k *keycloakAuth) terminateSession(rw http.ResponseWriter, req *http.Request, sessionID string) {
+	k.SessionStore.Delete(sessionID)
+	http.SetCookie(rw, clearSessionCookie(k.clientKey))
 	k.requireAuthentication(rw, req)
 }
 
-func (k *keycloakAuth) forwardSession(rw http.ResponseWriter, req *http.Request, token string) {
-	user, err := extractClaims(token, k.UserClaimName)
-	if err == nil {
-		req.Header.Set(k.UserHeaderName, user)
-	}
-	if k.UseAuthHeader {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	k.next.ServeHTTP(rw, req)
-}
+// startLogin begins a fresh authorization-code login for a navigation request.
+func (k *keycloakAuth) startLogin(rw http.ResponseWriter, req *http.Request) {
+	rw.Header().Set("Cache-Control", "no-store")
 
-func (k *keycloakAuth) serveSession(rw http.ResponseWriter, req *http.Request, session *Session) {
-	accessToken, _, expiresAt := session.snapshot()
-	status, err := k.introspectToken(accessToken)
-
-	if !k.SilentRenewal {
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		if status != tokenActive {
-			k.clearSessionCookie(rw)
-			k.redirectToKeycloak(rw, req)
-			return
-		}
-		k.forwardSession(rw, req, accessToken)
-		return
-	}
-
-	if status == tokenUnavailable {
-		http.Error(rw, "Keycloak introspection unavailable", http.StatusBadGateway)
-		return
-	}
-
-	if status == tokenInactive || time.Until(expiresAt) <= k.RefreshBeforeExpiry {
-		if renewErr := k.renewSession(session); renewErr != nil {
-			if isRefreshRefused(renewErr) {
-				k.terminateSession(rw, req)
-				return
-			}
-			if status == tokenInactive {
-				http.Error(rw, "Keycloak renewal unavailable", http.StatusBadGateway)
-				return
-			}
-		}
-	}
-
-	accessToken, _, _ = session.snapshot()
-	k.forwardSession(rw, req, accessToken)
-}
-
-func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	for _, substr := range k.IgnorePathPrefixes {
-		if strings.Contains(req.URL.Path, substr) {
-			k.next.ServeHTTP(rw, req)
-			return
-		}
-	}
-
-	cookie, err := req.Cookie("SessionID")
-	if err == nil {
-		session, exists := k.SessionStore.Get(cookie.Value)
-		if exists {
-			k.serveSession(rw, req, session)
-			return
-		}
-		if k.SilentRenewal {
-			k.terminateSession(rw, req)
-			return
-		}
-	}
-
-	authCode := req.URL.Query().Get("code")
-	if authCode == "" {
-		k.requireAuthentication(rw, req)
-		return
-	}
-
-	stateBase64 := req.URL.Query().Get("state")
-	if stateBase64 == "" {
-		k.requireAuthentication(rw, req)
-		return
-	}
-
-	tokenResponse, err := k.exchangeAuthCode(authCode, stateBase64)
+	rel := &url.URL{Path: req.URL.Path, RawPath: req.URL.RawPath, RawQuery: req.URL.RawQuery}
+	returnTarget, err := safeReturnTarget(rel)
 	if err != nil {
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		returnTarget = "/"
+	}
+
+	state, nonce, verifier, err := k.loginStore.Begin(returnTarget)
+	if err != nil {
+		k.writeUnavailable(rw)
 		return
 	}
 
-	session := &Session{AccessToken: tokenResponse.AccessToken}
-	if k.SilentRenewal {
-		if tokenResponse.RefreshToken == "" || tokenResponse.ExpiresIn <= 0 {
-			http.Error(rw, "Keycloak token response cannot be silently renewed: refresh_token and expires_in are required", http.StatusInternalServerError)
-			return
-		}
-		session.RefreshToken = tokenResponse.RefreshToken
-		session.ExpiresAt = time.Now().Add(time.Duration(tokenResponse.ExpiresIn) * time.Second)
-		session.RefreshExpiresAt = refreshExpiry(tokenResponse)
-	} else {
-		session.ExpiresAt = time.Now().Add(time.Hour)
+	authURL, err := k.oidc.authCodeURL(req.Context(), state, nonce, pkceChallenge(verifier))
+	if err != nil {
+		k.writeUnavailable(rw)
+		return
 	}
+
+	http.SetCookie(rw, loginCookie(k.clientKey, state))
+	http.Redirect(rw, req, authURL, http.StatusSeeOther)
+}
+
+func (k *keycloakAuth) handleCallback(rw http.ResponseWriter, req *http.Request) {
+	rw.Header().Set("Cache-Control", "no-store")
+
+	state := req.URL.Query().Get("state")
+	if state != "" {
+		http.SetCookie(rw, clearLoginCookie(k.clientKey, state))
+	}
+
+	if req.Method != http.MethodGet {
+		http.Error(rw, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if iss := req.URL.Query().Get("iss"); iss != "" && iss != k.issuer {
+		k.writeBadRequest(rw)
+		return
+	}
+
+	code := req.URL.Query().Get("code")
+	if code == "" || state == "" {
+		k.writeBadRequest(rw)
+		return
+	}
+
+	cookie, err := req.Cookie(loginCookieName(k.clientKey, state))
+	if err != nil || cookie.Value != state {
+		k.writeBadRequest(rw)
+		return
+	}
+
+	tx, ok := k.loginStore.Consume(state)
+	if !ok {
+		k.writeBadRequest(rw)
+		return
+	}
+
+	ts, err := k.oidc.exchange(req.Context(), code, tx.verifier, tx.nonce)
+	if err != nil {
+		k.writeUnavailable(rw)
+		return
+	}
+
+	session := &Session{}
+	session.applyTokenSet(ts)
 
 	sessionID, err := generateSessionID()
 	if err != nil {
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		k.writeUnavailable(rw)
 		return
 	}
 	k.SessionStore.Set(sessionID, session)
+	http.SetCookie(rw, sessionCookie(k.clientKey, sessionID))
 
-	sessionCookie := &http.Cookie{
-		Name:     "SessionID",
-		Value:    sessionID,
-		Secure:   true,
-		HttpOnly: true,
-		Path:     "/",
-		SameSite: http.SameSiteLaxMode,
-	}
-
-	http.SetCookie(rw, sessionCookie)
-	req.AddCookie(sessionCookie)
-
-	qry := req.URL.Query()
-	qry.Del("code")
-	qry.Del("state")
-	qry.Del("session_state")
-	req.URL.RawQuery = qry.Encode()
-	req.RequestURI = req.URL.RequestURI()
-
-	scheme := req.Header.Get("X-Forwarded-Proto")
-	host := req.Header.Get("X-Forwarded-Host")
-	originalURL := fmt.Sprintf("%s://%s%s", scheme, host, req.RequestURI)
-
-	http.Redirect(rw, req, originalURL, k.redirectStatus())
+	http.Redirect(rw, req, resolveReturnTarget(k.CallbackURL, tx.returnTarget), http.StatusSeeOther)
 }
 
-func extractClaims(tokenString, claimName string) (string, error) {
-	jwtContent := strings.Split(tokenString, ".")
-	if len(jwtContent) < 3 {
-		return "", fmt.Errorf("malformed jwt")
+// resolveReturnTarget restores a stored relative return target against the
+// configured callback origin.
+func resolveReturnTarget(callback *url.URL, target string) string {
+	rel, err := url.Parse(target)
+	if err != nil || !isSafeReturnTarget(target) {
+		return (&url.URL{Scheme: callback.Scheme, Host: callback.Host, Path: "/"}).String()
 	}
-
-	var jwtClaims map[string]interface{}
-	decoder := base64.StdEncoding.WithPadding(base64.NoPadding)
-
-	jwtBytes, _ := decoder.DecodeString(jwtContent[1])
-	if err := json.Unmarshal(jwtBytes, &jwtClaims); err != nil {
-		return "", err
-	}
-
-	if claimValue, ok := jwtClaims[claimName]; ok {
-		return fmt.Sprintf("%v", claimValue), nil
-	}
-	return "", fmt.Errorf("missing claim %s", claimName)
+	return callback.ResolveReference(rel).String()
 }
 
-func (k *keycloakAuth) exchangeAuthCode(authCode, stateBase64 string) (*KeycloakTokenResponse, error) {
-	stateBytes, _ := base64.StdEncoding.DecodeString(stateBase64)
-	var state state
-	err := json.Unmarshal(stateBytes, &state)
+func (k *keycloakAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	// Strip the configured user header and any incoming Authorization before
+	// routing; only validated sessions may reintroduce them.
+	req.Header.Del(k.UserHeaderName)
+	req.Header.Del("Authorization")
+
+	if !validRequestPath(req.URL) {
+		k.writeBadRequest(rw)
+		return
+	}
+
+	if k.isCallbackPath(req.URL.Path) {
+		k.handleCallback(rw, req)
+		return
+	}
+
+	if k.isIgnoredPath(req.URL.Path) {
+		req.Header.Del(k.UserHeaderName)
+		req.Header.Del("Authorization")
+		k.next.ServeHTTP(rw, req)
+		return
+	}
+
+	if sessionID, ok := k.sessionID(req); ok {
+		if session, exists := k.SessionStore.Get(sessionID); exists {
+			k.serveSession(rw, req, sessionID, session)
+			return
+		}
+		http.SetCookie(rw, clearSessionCookie(k.clientKey))
+		k.requireAuthentication(rw, req)
+		return
+	}
+
+	k.requireAuthentication(rw, req)
+}
+
+func (k *keycloakAuth) sessionID(req *http.Request) (string, bool) {
+	cookie, err := req.Cookie(sessionCookieName(k.clientKey))
+	if err != nil || cookie.Value == "" {
+		return "", false
+	}
+	return cookie.Value, true
+}
+
+func (k *keycloakAuth) serveSession(rw http.ResponseWriter, req *http.Request, sessionID string, session *Session) {
+	accessToken, _, expiresAt := session.snapshot()
+
+	status, err := k.oidc.introspect(req.Context(), accessToken)
 	if err != nil {
-		return nil, err
+		k.writeUnavailable(rw)
+		return
 	}
 
-	target := k.KeycloakURL.JoinPath(
-		"realms",
-		k.KeycloakRealm,
-		"protocol",
-		"openid-connect",
-		"token",
-	)
-
-	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: k.InsecureSkipVerify}
-
-	resp, err := http.PostForm(target.String(),
-		url.Values{
-			"grant_type":    {"authorization_code"},
-			"client_id":     {k.ClientID},
-			"client_secret": {k.ClientSecret},
-			"code":          {authCode},
-			"redirect_uri":  {state.RedirectURL},
-		})
-
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, &keycloakError{Status: resp.StatusCode, Body: string(body)}
+	needsRenewal := false
+	force := false
+	switch status {
+	case tokenInactive:
+		needsRenewal = true
+		force = true
+	case tokenActive:
+		if time.Until(expiresAt) <= k.RefreshBeforeExpiry {
+			needsRenewal = true
+		}
 	}
 
-	var tokenResponse KeycloakTokenResponse
-	err = json.NewDecoder(resp.Body).Decode(&tokenResponse)
-	if err != nil {
-		return nil, err
+	if needsRenewal {
+		if err := k.renewSession(req.Context(), session, accessToken, force); err != nil {
+			if isOIDCRefusal(err) {
+				k.terminateSession(rw, req, sessionID)
+				return
+			}
+			if force {
+				k.writeUnavailable(rw)
+				return
+			}
+		}
 	}
 
-	return &tokenResponse, nil
+	k.forwardSession(rw, req, session)
 }
 
-type keycloakError struct {
-	Status int
-	Body   string
-}
+// renewSession refreshes the session under its lock. A concurrent caller that
+// already rotated the observed access token makes this call a no-op.
+func (k *keycloakAuth) renewSession(ctx context.Context, session *Session, observedAccessToken string, force bool) error {
+	session.mu.Lock()
+	defer session.mu.Unlock()
 
-func (e *keycloakError) Error() string {
-	return "received bad response from Keycloak: " + e.Body
-}
-
-func isRefreshRefused(err error) bool {
-	var kcErr *keycloakError
-	if !errors.As(err, &kcErr) {
-		return false
+	if session.AccessToken != observedAccessToken {
+		return nil
 	}
-	return (kcErr.Status == http.StatusBadRequest || kcErr.Status == http.StatusUnauthorized) &&
-		strings.Contains(kcErr.Body, "invalid_grant")
-}
-
-func (k *keycloakAuth) refreshAccessToken(refreshToken string) (*KeycloakTokenResponse, error) {
-	target := k.KeycloakURL.JoinPath(
-		"realms",
-		k.KeycloakRealm,
-		"protocol",
-		"openid-connect",
-		"token",
-	)
-
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: k.InsecureSkipVerify},
-	}
-	client := &http.Client{Transport: tr}
-
-	resp, err := client.PostForm(target.String(), url.Values{
-		"grant_type":    {"refresh_token"},
-		"client_id":     {k.ClientID},
-		"client_secret": {k.ClientSecret},
-		"refresh_token": {refreshToken},
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, &keycloakError{Status: resp.StatusCode, Body: string(body)}
-	}
-
-	var tokenResponse KeycloakTokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResponse); err != nil {
-		return nil, err
-	}
-	if tokenResponse.ExpiresIn <= 0 {
-		return nil, errors.New("missing expires_in")
-	}
-
-	return &tokenResponse, nil
-}
-
-func (k *keycloakAuth) renewSession(s *Session) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if time.Until(s.ExpiresAt) > k.RefreshBeforeExpiry {
+	if !force && time.Until(session.ExpiresAt) > k.RefreshBeforeExpiry {
 		return nil
 	}
 
-	tokenResponse, err := k.refreshAccessToken(s.RefreshToken)
+	ts, err := k.oidc.refresh(ctx, session.RefreshToken)
 	if err != nil {
 		return err
 	}
-	if tokenResponse.AccessToken == "" {
-		return errors.New("missing access_token")
+
+	if ts.Identity.Subject != "" {
+		if ts.Identity.Subject != session.Subject {
+			return newOIDCError(oidcErrRefusal, errors.New("oidc: refresh changed the session subject"))
+		}
+		if _, present := ts.Identity.Claims["nonce"]; present && subtle.ConstantTimeCompare([]byte(ts.Identity.Nonce), []byte(session.Nonce)) != 1 {
+			return newOIDCError(oidcErrRefusal, errors.New("oidc: refresh changed the session nonce"))
+		}
+		if !sameAudienceSet(session.Audience, ts.Identity.Audience) {
+			return newOIDCError(oidcErrRefusal, errors.New("oidc: refresh changed the session audience"))
+		}
 	}
 
-	s.AccessToken = tokenResponse.AccessToken
-	if tokenResponse.RefreshToken != "" {
-		s.RefreshToken = tokenResponse.RefreshToken
-	}
-	s.ExpiresAt = time.Now().Add(time.Duration(tokenResponse.ExpiresIn) * time.Second)
-	s.RefreshExpiresAt = refreshExpiry(tokenResponse)
+	session.applyTokenSetLocked(ts)
 	return nil
 }
 
-// refreshExpiry is zero when Keycloak reports no refresh-token expiry, for
-// example for offline tokens, so such sessions are never evicted as expired.
-func refreshExpiry(tokenResponse *KeycloakTokenResponse) time.Time {
-	if tokenResponse.RefreshExpiresIn <= 0 {
-		return time.Time{}
+func sameAudienceSet(first, second []string) bool {
+	firstSet := make(map[string]struct{}, len(first))
+	secondSet := make(map[string]struct{}, len(second))
+	for _, audience := range first {
+		firstSet[audience] = struct{}{}
 	}
-	return time.Now().Add(time.Duration(tokenResponse.RefreshExpiresIn) * time.Second)
+	for _, audience := range second {
+		secondSet[audience] = struct{}{}
+	}
+	if len(firstSet) != len(secondSet) {
+		return false
+	}
+	for audience := range firstSet {
+		if _, ok := secondSet[audience]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
-func (k *keycloakAuth) redirectToKeycloak(rw http.ResponseWriter, req *http.Request) {
-	scheme := req.Header.Get("X-Forwarded-Proto")
-	host := req.Header.Get("X-Forwarded-Host")
-	originalURL := fmt.Sprintf("%s://%s%s", scheme, host, req.RequestURI)
+// forwardSession sets the validated user and, when configured, the bearer
+// token, then hands the request to the next handler. It fails closed without
+// calling next when the configured identity claim is absent or not a nonempty
+// string.
+func (k *keycloakAuth) forwardSession(rw http.ResponseWriter, req *http.Request, session *Session) {
+	session.mu.Lock()
+	raw := session.Claims[k.UserClaimName]
+	session.mu.Unlock()
 
-	state := state{
-		RedirectURL: originalURL,
+	user, ok := raw.(string)
+	if !ok || user == "" {
+		k.writeUnavailable(rw)
+		return
 	}
 
-	stateBytes, _ := json.Marshal(state)
-	stateBase64 := base64.StdEncoding.EncodeToString(stateBytes)
-
-	redirectURL := k.KeycloakURL.JoinPath(
-		"realms",
-		k.KeycloakRealm,
-		"protocol",
-		"openid-connect",
-		"auth",
-	)
-	redirectURL.RawQuery = url.Values{
-		"response_type": {"code"},
-		"client_id":     {k.ClientID},
-		"redirect_uri":  {originalURL},
-		"state":         {stateBase64},
-		"scope":         {k.Scope},
-	}.Encode()
-
-	http.Redirect(rw, req, redirectURL.String(), k.redirectStatus())
-}
-
-type tokenStatus int
-
-const (
-	tokenActive tokenStatus = iota
-	tokenInactive
-	tokenUnavailable
-)
-
-func (k *keycloakAuth) introspectToken(token string) (tokenStatus, error) {
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: k.InsecureSkipVerify},
+	req.Header.Set(k.UserHeaderName, user)
+	if k.UseAuthHeader {
+		accessToken, _, _ := session.snapshot()
+		req.Header.Set("Authorization", "Bearer "+accessToken)
 	}
-
-	client := &http.Client{Transport: tr}
-
-	data := url.Values{
-		"token":         {token},
-		"client_id":     {k.ClientID},
-		"client_secret": {k.ClientSecret},
-	}
-
-	req, err := http.NewRequest(
-		http.MethodPost,
-		k.KeycloakURL.JoinPath(
-			"realms",
-			k.KeycloakRealm,
-			"protocol",
-			"openid-connect",
-			"token",
-			"introspect",
-		).String(),
-		strings.NewReader(data.Encode()),
-	)
-	if err != nil {
-		return tokenUnavailable, err
-	}
-
-	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return tokenUnavailable, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return tokenUnavailable, nil
-	}
-
-	var introspectResponse struct {
-		Active bool `json:"active"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&introspectResponse); err != nil {
-		return tokenUnavailable, err
-	}
-
-	if introspectResponse.Active {
-		return tokenActive, nil
-	}
-	return tokenInactive, nil
+	k.next.ServeHTTP(rw, req)
 }

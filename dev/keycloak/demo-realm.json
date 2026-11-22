@@ -1,6 +1,7 @@
 {
   "realm": "demo",
   "enabled": true,
+  "accessTokenLifespan": 10,
   "sslRequired": "none",
   "clients": [
     {
@@ -12,7 +13,7 @@
       "publicClient": false,
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": false,
-      "redirectUris": ["http://helloworld1.localhost:8000/*"],
+      "redirectUris": ["http://helloworld1.localhost:8000/callback"],
       "webOrigins": ["http://helloworld1.localhost:8000"]
     },
     {
@@ -24,7 +25,7 @@
       "publicClient": false,
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": false,
-      "redirectUris": ["http://helloworld2.localhost:8000/*"],
+      "redirectUris": ["http://helloworld2.localhost:8000/callback"],
       "webOrigins": ["http://helloworld2.localhost:8000"]
     }
   ],

@@ -51,6 +51,8 @@ make vm-demo-shared    # switch to shared mode and run its smoke test
 
 You can re-run `make vm-up` safely. The first run takes several minutes. It installs packages, k3s and Keycloak, and builds the helloworld image on the VM, so there is no CPU-architecture mismatch with your machine. The demo targets only re-render the routing layer, so switching modes takes seconds.
 
+`make vm-demo-per-app` and `make vm-demo-shared` only render and apply routing resources. Run `make vm-sync` after changing plugin source so Traefik reloads it, and run `make vm-up` after changing the Keycloak realm or other deployment manifests so the affected workload rolls out.
+
 ### Browser walkthrough
 
 1. Open `https://$VM_HOST/helloworld1/`. Accept the self-signed certificate warning once for this host.
@@ -60,42 +62,45 @@ You can re-run `make vm-up` safely. The first run takes several minutes. It inst
 
 ## The two modes
 
-The plugin always issues a single cookie named `SessionID` with `Path=/`. It stores sessions in memory, shared by every plugin instance that uses the same Keycloak client. Traefik creates a separate plugin instance for **each router** that uses a middleware, but instances configured with the same Keycloak URL, realm, and client ID see the same sessions. Together, these facts determine how path-based apps behave.
+The plugin issues one host-only `__Host-` session cookie per client, whose name is derived from the normalized Keycloak URL, realm, and client ID. Sessions are held in process memory, shared by every middleware instance configured with the same client. Traefik creates a separate plugin instance for **each router**, but instances that share a client share one session store and one cookie name. Together, these facts determine how path-based apps behave.
 
 ### Per-app clients (`make vm-demo-per-app`)
 
-Each path has its own Keycloak client (`helloworld1`, `helloworld2`), its own plugin middleware and its own router.
+Each path has its own Keycloak client (`helloworld1`, `helloworld2`), its own middleware and its own router.
 
 ```
 websecure ─ /helloworld1 → helloworld1-auth → strip /helloworld1 → helloworld1
           └ /helloworld2 → helloworld2-auth → strip /helloworld2 → helloworld2
 ```
 
-Because both apps share one host, the `SessionID` cookie that helloworld2 issues **replaces** helloworld1's, and the other way round. Each switch between apps sends the browser through Keycloak again. Keycloak's own SSO session makes this a silent redirect without a password, but every switch costs an extra round trip, and a POST body sent across the switch is lost. The smoke test asserts this collision explicitly:
+The two clients issue two different `__Host-` cookies, so they do not overwrite each other: a browser holds both, and each path keeps its own session independently. Switching apps does not force another Keycloak round trip. Keycloak's own SSO session makes the first visit to each app a silent redirect without a password. The smoke test asserts the isolation explicitly, including that helloworld2's cookie is unknown to helloworld1:
 
 ```
-COLLISION: returning to helloworld1 with helloworld2's SessionID forces another Keycloak round-trip
+helloworld2 completes SSO without a password and issues its own __Host- cookie
+helloworld1's session survives helloworld2's login (distinct-client cookie isolation)
 ```
 
-Host-based routing, as in the local Podman stack, does not have this problem, because each host keeps its own cookie.
+Host-based routing, as in the local Podman stack, behaves the same way, because each host keeps its own client and cookie.
 
 ### Shared multi-app client (`make vm-demo-shared`)
 
-One Keycloak client (`helloworld-shared`, with redirect URIs for both paths) and **one** plugin instance protect both paths. Two routers sharing one Middleware would also share sessions, because both instances use the same client. This demo instead has one router authenticate every app path and hand the request to a second, cluster-internal Traefik entrypoint. Per-path routers there strip the prefix and pick the backend:
+One Keycloak client (`helloworld-shared`, with a single redirect URI for its callback) protects both paths. Two routers each reference their own middleware, both configured with the same client, and a third route serves the fixed callback:
 
 ```
-websecure ─ /helloworld1 || /helloworld2 → shared-auth → traefik-internal:8001 (ClusterIP only)
-internal  ─ /helloworld1 → strip /helloworld1 → helloworld1
-          └ /helloworld2 → strip /helloworld2 → helloworld2
+websecure ─ /helloworld1 → helloworld1-shared-auth → strip /helloworld1 → helloworld1
+          └ /helloworld2 → helloworld2-shared-auth → strip /helloworld2 → helloworld2
+          └ /callback    → helloworld1-shared-auth (intercepted)
 ```
 
-After one login, both paths accept the same `SessionID` with no further Keycloak redirects. `X-Forwarded-User` and `Authorization` pass through the internal hop unchanged. The `internal` entrypoint is exposed only on the `traefik-internal` ClusterIP service, never on the VM's public ports. Any pod in the cluster could still reach it and forge those headers, so a production setup should restrict it with a NetworkPolicy.
+Traefik creates a plugin instance per middleware, so the two app routers are separate plugin instances. Because both middlewares use the same Keycloak client, they still share one process-wide session store and one `__Host-` cookie. After one login, both paths accept the same cookie with no further Keycloak redirects; the smoke test logs in through helloworld1's middleware and then authenticates helloworld2 with the resulting cookie, proving the store is shared across instances.
 
 ### Details that apply to both modes
 
-- The auth middleware runs **before** `StripPrefix`. The plugin builds the `redirect_uri` from the request URI, so the prefix must still be present. The smoke test checks that the redirect URI keeps `/helloworldN/`.
-- `/helloworldN/healthz` bypasses authentication through `IgnorePathPrefixes: /favicon.ico,/healthz`. The plugin matches these entries with `strings.Contains`, so any path that *contains* `/healthz` skips authentication. Keep that in mind before copying this configuration.
-- Sessions are held in memory in the Traefik pod. They are lost when Traefik restarts, for example after `make vm-sync`, and they would break with more than one Traefik replica. k3s runs one replica by default.
+- The auth middleware runs **before** `StripPrefix`. The plugin sends a fixed `CallbackURL` to Keycloak as `redirect_uri` regardless of the requested path, and restores the original path after the callback. The smoke test checks that the redirect URI is the exact registered callback and that the browser returns to the original `/helloworldN/protected` path.
+- `/helloworldN/healthz` bypasses authentication through `IgnorePathPrefixes`, which matches by path segment: `/healthz` matches `/healthz` and `/healthz/...`, not every path that merely contains the text.
+- The plugin strips incoming `X-Forwarded-User` and `Authorization` on every request, so a client cannot spoof them. The smoke test sends hostile values on protected and ignored paths and checks they are removed.
+- Sessions are held in memory in the Traefik pod and are lost when Traefik restarts, for example after `make vm-sync`. Exactly one Traefik replica is supported; k3s runs one by default.
+- The smoke test finishes with a token lifecycle check. The demo realm issues 10-second access tokens and the middleware refreshes 2 seconds before expiry. The test waits 11 seconds and requires a changed access-token `jti`, then revokes Alice's Keycloak sessions through the `/auth` Admin REST API and requires the old plugin cookie to redirect to login with an expired session cookie. Revocation ends the browser's Keycloak SSO session, so this check runs last. These administrator credentials and endpoints are demo-only.
 
 ## Develop the plugin
 
@@ -105,7 +110,7 @@ Edit the plugin in your checkout, then push the source to the VM's Traefik:
 make vm-sync
 ```
 
-This copies the plugin's `*.go`, `go.mod` and `.traefik.yml` to `/opt/keycloakopenid/src/github.com/bcambl/keycloakopenid` on the VM. The k3s Traefik chart mounts that directory as a local plugin (`experimental.localPlugins` with `type: hostPath`). The target then restarts Traefik so it reloads the interpreted plugin. Run `make vm-demo-per-app` or `make vm-demo-shared` afterwards to re-test.
+This copies the plugin's `*.go`, `go.mod`, `go.sum`, `.traefik.yml`, and `vendor/` directory to `/opt/keycloakopenid/src/github.com/bcambl/keycloakopenid` on the VM. The k3s Traefik chart mounts that directory as a local plugin (`experimental.localPlugins` with `type: hostPath`). The target then restarts Traefik so it reloads the interpreted plugin. Run `make vm-demo-per-app` or `make vm-demo-shared` afterwards to re-test.
 
 ## All VM targets
 
@@ -150,5 +155,5 @@ Rendered manifests are kept on the VM in `/opt/keycloakopenid/manifests`. Every 
 - **The smoke test times out waiting for the routes.** Run `make vm-status` and `make vm-logs`. Keycloak can take a few minutes on its first start. A plugin load error appears in the Traefik log.
 - **The Keycloak callback fails with a token-exchange or connection error.** Traefik itself calls `https://$VM_HOST/auth` to exchange the code and introspect tokens. When `VM_HOST` is an IP address, the pod reaches it through the k3s service load balancer. When it is a DNS name, the playbook adds a Traefik `hostAliases` entry that maps it to the VM's default IPv4 address. If the VM has several interfaces, make sure that address is reachable.
 - **Pods cannot reach each other or DNS.** The playbook adds the pod (10.42.0.0/16) and service (10.43.0.0/16) networks to firewalld's trusted zone. If firewalld was reconfigured afterwards, re-run `make vm-up`.
-- **The Traefik chart rejects the values.** `localPlugins` with `type: hostPath` and `service.additionalServices` require the Traefik chart bundled with recent k3s releases, so keep `K3S_VERSION` at the pinned default or newer. The rendered values are in `/var/lib/rancher/k3s/server/manifests/traefik-config.yaml` on the VM. The `helm-install-traefik` job logs in `kube-system` show why they were rejected.
-- **The browser loops back to Keycloak.** Clear cookies for `$VM_HOST`. In per-app mode a redirect on every app switch is expected, as described above.
+- **The Traefik chart rejects the values.** `localPlugins` with `type: hostPath` requires the Traefik chart bundled with recent k3s releases, so keep `K3S_VERSION` at the pinned default or newer. The rendered values are in `/var/lib/rancher/k3s/server/manifests/traefik-config.yaml` on the VM. The `helm-install-traefik` job logs in `kube-system` show why they were rejected.
+- **The browser loops back to Keycloak.** Clear cookies for `$VM_HOST`, then sign in again.

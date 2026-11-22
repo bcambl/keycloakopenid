@@ -1,6 +1,7 @@
 {
   "realm": "demo",
   "enabled": true,
+  "accessTokenLifespan": 10,
   "sslRequired": "external",
   "clients": [
 {% for client in keycloak_clients %}
@@ -13,7 +14,7 @@
       "publicClient": false,
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": false,
-      "redirectUris": {{ client.paths | map('regex_replace', '^(.*)$', 'https://' ~ vm_host ~ '\\1*') | list | to_json }},
+      "redirectUris": ["https://{{ vm_host }}{{ client.callback }}"],
       "webOrigins": ["https://{{ vm_host }}"]
     }{{ "," if not loop.last else "" }}
 {% endfor %}

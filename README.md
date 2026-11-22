@@ -1,53 +1,22 @@
 # Keycloak Authentication Plugin
 
-This Keycloak authentication plugin is a middleware for Go applications, which manages user authentication using Keycloak, an open-source identity and access management solution.
+This Traefik middleware authenticates browser requests against Keycloak using the OpenID Connect authorization-code flow with S256 PKCE. It validates the returned ID token, keeps the session in a bounded in-memory LRU store, and forwards the authenticated user to the protected application.
 
-## Code Explanation
+The plugin is a rewrite of the earlier keycloakopenid middleware. The flow is now a standard confidential-client authorization-code flow: state and nonce, PKCE, validated ID-token claims, a host-only `__Host-` session cookie, header sanitization, and process-local session storage.
 
-### Structs
+## How it works
 
-The plugin uses several data structures:
+1. A request without a valid session is redirected (303) to Keycloak's authorization endpoint. The plugin sends a random `state`, a `nonce`, and an S256 PKCE `code_challenge`.
+2. Keycloak authenticates the user and redirects back to the plugin's fixed callback with an authorization `code` and `state`.
+3. The plugin exchanges the code, verifies the `state` and `nonce`, validates the ID token, and stores the session.
+4. A host-only `__Host-` session cookie is issued, and the browser is redirected back to the original path.
+5. On later requests the plugin introspects the access token, renews it with the refresh token when it is within `RefreshBeforeExpiry` of expiry, and forwards the request.
 
-- Config: This struct stores the configuration details of the Keycloak instance, such as the URL, client ID, and client secret.
-  keycloakAuth: This struct is the main component of the plugin, storing the next HTTP handler and the configuration.
-  KeycloakTokenResponse: This struct stores the response from Keycloak when a token is requested.
-- state: This struct stores the URL to which the user should be redirected after successful authentication.
+Only navigation requests (a browser `GET` with an `Accept: text/html`) are redirected to Keycloak. API and `fetch`/XHR requests receive `401 {"error":"authentication_required"}` with no redirect, so a single-page app can reload the current page in the same tab.
 
-### Main Functions
+## Configuration
 
-The plugin has several main functions:
-
-- CreateConfig(): Initializes and returns a new Config struct.
-- New(): Creates a new Keycloak authentication middleware. It checks the provided configuration and returns an error if the Keycloak URL or client ID is not provided.
-- ServeHTTP(): This is the main function of the middleware. It checks for an "Authorization" cookie in the request. If the cookie exists and its value starts with "Bearer ", it verifies the token. If the token is valid, it allows the request to proceed. If the token is invalid, it redirects the request to Keycloak for authentication. If the cookie does not exist, it checks for an authorization code in the request URL. If the code exists, it exchanges it for a token. If the code does not exist, it redirects the request to Keycloak for authentication.
-- exchangeAuthCode(): Exchanges an authorization code for a token.
-- redirectToKeycloak(): Redirects the request to Keycloak for authentication.
-- verifyToken(): Verifies the validity of a token.
-
-## How it Works
-
-When a request is received, the middleware first checks for an "Authorization" cookie. If it exists and the token inside is valid, the request is allowed to proceed.
-If the token is invalid or doesn't exist, the middleware checks for an authorization code in the request URL.
-If the authorization code exists, the middleware exchanges it for a token, sets this token as a cookie, and redirects the user to their original location.
-If the authorization code doesn't exist, the middleware redirects the user to Keycloak for authentication.
-The user is then prompted to enter their credentials on the Keycloak login page. After successful authentication, Keycloak redirects the user back to the application with an authorization code.
-The middleware then exchanges this code for a token and the process starts over.
-By using this middleware, applications can easily integrate with Keycloak for user authentication without having to implement the logic themselves.
-
-## Installation
-
-First, enable the plugins support in your Traefik configuration file (traefik.yml or traefik.toml):
-
-```yaml
-experimental:
-  plugins:
-    keycloakopenid:
-      moduleName: "github.com/bcambl/keycloakopenid"
-      version: "v0.1.38"
-```
-
-Usage
-Add the plugin's specific configuration to your Traefik routers:
+Minimum configuration:
 
 ```yaml
 http:
@@ -55,91 +24,108 @@ http:
     my-keycloakopenid:
       plugin:
         keycloakopenid:
-          KeycloakURL: "my-keycloak-url.com" # <- Also supports complete URL, e.g. https://my-keycloak-url.com/auth
-          ClientID: "<CLIENT_ID"
-          ClientSecret: "<CLIENT_SECRET"
-          KeycloakRealm: "<REALM"
-          Scope: "<Scope [space deliminated] (default: 'openid', example: 'openid profile email')"
-          TokenCookieName: "<TOKEN_COOKIE_NAME (default: 'AUTH_TOKEN')"
-          UseAuthHeader: "<true|false (default: false)"
-          SilentRenewal: "<true|false (default: true)>"
-          RefreshBeforeExpiry: "<duration (default: '30s', example: '45s')>"
-          IgnorePathPrefixes: "/api,/favicon.ico [comma deliminated] (optional)"
+          KeycloakURL: "https://my-keycloak-url.com"
+          ClientID: "<CLIENT_ID>"
+          ClientSecret: "<CLIENT_SECRET>"
+          KeycloakRealm: "<REALM>"
+          CallbackURL: "https://my-app.example.com/callback"
 ```
 
-Alternatively, ClientID and ClientSecret can be read from a file to support Docker Secrets and Kubernetes Secrets:
+`ClientID` and `ClientSecret` can also be read from files (Docker or Kubernetes secrets):
 
 ```yaml
-http:
-  middlewares:
-    my-keycloakopenid:
-      plugin:
-        keycloakopenid:
-          KeycloakURL: "https://my-keycloak-url.com/auth"
           ClientIDFile: "/run/secrets/clientId.txt"
           ClientSecretFile: "/run/secrets/clientSecret.txt"
-          KeycloakRealm: "<REALM"
-          Scope: "<SCOPE [space deliminated] (default: 'openid', example: 'openid profile email')"
-          TokenCookieName: "<TOKEN_COOKIE_NAME (default: 'AUTH_TOKEN')"
-          UseAuthHeader: "<true|false (default: false)"
 ```
 
-Last but not least, each configuration can be read from environment file to support some Kubernetes configurations:
+Or from environment variables:
 
 ```yaml
-http:
-  middlewares:
-    my-keycloakopenid:
-      plugin:
-        keycloakopenid:
           KeycloakURLEnv: "MY_KEYCLOAK_URL"
           ClientIDEnv: "MY_KEYCLOAK_CLIENT_ID"
           ClientSecretEnv: "MY_KEYCLOAK_CLIENT_SECRET"
           KeycloakRealmEnv: "MY_KEYCLOAK_REALM"
-          ScopeEnv: "SCOPE [space deliminated] (default: 'openid', example: 'openid profile email')"
-          TokenCookieNameEnv: "TOKEN_COOKIE_NAME (default: 'AUTH_TOKEN')"
-          UseAuthHeaderEnv: "USE_AUTH_HEADER (default: false)"
-          SilentRenewalEnv: "SILENT_RENEWAL (default: true)"
-          RefreshBeforeExpiryEnv: "REFRESH_BEFORE_EXPIRY (default: '30s')"
 ```
 
-This plugin also sets a header with a claim from Keycloak, as it has become reasonably common. Claim name and header name can be modified.  
-The default claim is <code>preferred_username</code>, the default header name is <code>X-Forwarded-User</code> :
+### Options
 
-```yaml
-http:
-  middlewares:
-    my-keycloakopenid:
-      plugin:
-        keycloakopenid:
-          KeycloakURL: "my-keycloak-url.com" # <- Also supports complete URL, e.g. https://my-keycloak-url.com/auth
-          ClientID: "<CLIENT_ID"
-          ClientSecret: "<CLIENT_SECRET"
-          KeycloakRealm: "<REALM"
-          Scope: "<SCOPE [space deliminated] (default: 'openid', example: 'openid profile email')"
-          TokenCookieName: "TOKEN_COOKIE_NAME (default: "AUTH_TOKEN)"
-          UseAuthHeader: "true|false (default: false)"
-          UserClaimName: "my-uncommon-claim"
-          UserHeaderName: "X-Custom-Header"
-```
+| Option | Default | Description |
+|---|---|---|
+| `KeycloakURL` | - | Keycloak base URL. A complete URL or a bare host is accepted. Must use HTTPS except on loopback hosts and must not include userinfo, a query, or a fragment. Required. |
+| `ClientID` | - | OIDC client ID. Required. |
+| `ClientSecret` | - | OIDC client secret. Required for the confidential-client code exchange, refresh, and introspection. |
+| `KeycloakRealm` | - | Keycloak realm. Required. |
+| `CallbackURL` | - | Fixed callback URL the browser returns to. Must be registered exactly as a redirect URI on the Keycloak client. Required. |
+| `Scope` | `openid` | Space-delimited scopes. `openid` is always added. |
+| `SessionCapacity` | `10000` | Maximum number of sessions held per configured client. Least-recently-used sessions are evicted beyond this bound. |
+| `UseAuthHeader` | `false` | Also set the bearer access token in the `Authorization` header. |
+| `UserClaimName` | `preferred_username` | ID-token claim forwarded as the user identity. |
+| `UserHeaderName` | `X-Forwarded-User` | Header the user identity is written to. Must be a valid RFC 7230 header field name and must not be `Authorization`. |
+| `IgnorePathPrefixes` | none | Comma-delimited path prefixes that bypass authentication. Matched by path segment, not substring. Trailing slashes are removed, so `/api/` behaves as `/api`. |
+| `LegacySupport` | `false` | Target an older Keycloak instance that serves realms under `/auth`. When true, the configured base path is statically extended with a final `auth` segment; an existing `/auth` suffix is left unchanged. |
+| `RefreshBeforeExpiry` | `30s` | How close to access-token expiry a session is renewed. Must not be negative. |
+| `InsecureSkipVerify` | `false` | Skip TLS certificate verification of an HTTPS Keycloak connection. Development only; it does not permit plain HTTP. |
 
-## Silent renewal
+`KeycloakURL`, `InsecureSkipVerify`, `ClientID`, `ClientSecret`, `KeycloakRealm`, `Scope`, `UseAuthHeader`, `IgnorePathPrefixes`, `LegacySupport`, and `RefreshBeforeExpiry` each also accept an `...Env` variant. `CallbackURL` and `SessionCapacity` are set directly only.
 
-Silent renewal is on by default. The plugin keeps a user's session alive for as long as Keycloak allows, without any user interruption:
+Every referenced environment variable must be set and non-empty. Boolean variables parse with Go's boolean syntax (`true`, `false`, `1`, `0`, and their variants); a missing, empty, or malformed value is a configuration error. Environment values take precedence over directly configured values, so a valid `UseAuthHeaderEnv: "false"` overrides `UseAuthHeader: true`.
 
-- After the Keycloak callback, the session stores the access token, the refresh token, and the access token expiry.
-- On each request the access token is introspected as usual. When it is within `RefreshBeforeExpiry` of its expiry, or already inactive, the plugin renews it with the refresh-token grant and continues the request with the new token. No redirect happens.
-- Renewals are serialized per session and rotated refresh tokens are stored, so concurrent requests are safe.
-- Only when Keycloak refuses the refresh (`invalid_grant`), meaning the Keycloak session is over, does the session end: browser navigation is redirected to the Keycloak login with a 303, and fetch/XHR requests receive a 401 with `{"error":"authentication_required"}` and no redirect, so the application can reload the current page in the same tab.
-- A Keycloak outage is never treated as a session end: introspection or renewal transport failures answer 502 and leave the session intact. A renewal failure while the current access token is still active lets the request proceed with that token.
-- The hard-coded one-hour session lifetime is not used in this mode; Keycloak's SSO and client session settings decide how long a user stays logged in.
+Warning: an ignore prefix of `/` matches every valid absolute path and therefore disables authentication for every request routed through that middleware. Use it only on a router that must remain fully public.
 
-Requirements and limitations:
+Transport security is separate from certificate verification. A configured `KeycloakURL`, and every endpoint returned by OIDC discovery, must use HTTPS unless the host is a loopback address (`localhost`, `*.localhost`, or a loopback IP). Discovered endpoint URLs may carry a query string but must not carry userinfo or a fragment. `InsecureSkipVerify` only disables TLS certificate checks on an HTTPS connection; it never upgrades or permits a plain-HTTP provider.
 
-- The Keycloak token response must contain a `refresh_token` (the default for the standard flow with confidential clients). If it is missing, the callback fails with an error so the misconfiguration is visible.
-- Sessions stay in memory in the Traefik process and are shared by every plugin instance configured with the same Keycloak URL, realm, and client ID. Traefik creates an instance for each router that uses the middleware and recreates instances on every dynamic configuration reload; neither loses sessions. A Traefik restart means users sign in again. Run a single Traefik instance or use sticky sessions; multiple non-sticky replicas would race refresh-token rotation and force repeated logins.
-- A session is removed once its access token and its refresh token (`refresh_expires_in`) have both expired. Sessions whose refresh token has no reported expiry, such as offline tokens, stay until Keycloak refuses a refresh.
-- With `SilentRenewal: false`, the legacy behavior is used instead: one-hour session lifetime, introspection per request, and 307 redirects. Use this opt-out if you want the old behavior, for example to force periodic re-authentication.
+### CallbackURL registration
+
+`CallbackURL` is fixed and must be registered verbatim in the Keycloak client's `Valid redirect URIs` alongside any `Web origins`. The plugin always sends this exact URL as `redirect_uri`, regardless of the path the user requested, and restores the original path after the callback. It accepts `http` only for loopback hosts (`localhost`, `*.localhost`, and loopback IPs); any deployed callback must be `https`.
+
+### ID-token requirements
+
+The plugin validates the ID token returned by Keycloak: its signature, issuer, audience, authorized party (`azp` when the token has multiple audiences), required expiry and issued-at (`iat`) claims, and access-token hash (`at_hash`), plus the `nonce` echoed from the login. The token response must include an `access_token`, a `refresh_token`, and a positive `expires_in` lifetime. The claim named by `UserClaimName` (default `preferred_username`) must be present and a non-empty string; otherwise the plugin fails closed and does not call the next handler. A refreshed ID token must retain the original subject and audience set. Its nonce may be omitted, but must match the original login nonce when present.
+
+### Header handling
+
+The plugin strips the configured user header (default `X-Forwarded-User`) and any incoming `Authorization` from every request, on protected and ignored paths alike, before the request is routed. Only a validated session reintroduces them: the user header always, and the bearer token when `UseAuthHeader` is set. Downstream applications can therefore trust these headers only behind this middleware.
+
+## Sessions and storage
+
+Sessions are held in memory, inside the Traefik process. They are keyed by the normalized Keycloak URL, realm, and client ID, so every middleware instance configured with the same client shares one session store and one `__Host-` cookie. Pending login transactions are shared the same way.
+
+- Exactly one Traefik replica is supported. Sessions are process-local and never shared between replicas or persisted.
+- A Traefik restart or replica replacement loses every session; users sign in again.
+- The stores for a client survive ordinary middleware reloads. Each `New` call acquires the shared stores and releases that acquisition when its context is canceled; a reacquisition during the five-minute grace period keeps the existing state.
+- When the last reference to a client is released and no new middleware instance acquires it within five minutes, its stores retire: sessions and pending logins are purged, cleanup workers stop, and later writes fail until a new client is constructed. Traefik does not call a `Close` method on middleware instances; release is driven by the `New` context.
+- Each per-client store is bounded by `SessionCapacity` with least-recently-used eviction.
+- A session ends when Keycloak refuses a refresh (`invalid_grant`); navigation is redirected to Keycloak and API requests receive `401`.
+- Introspection failures answer `502` and leave the session intact. A renewal failure for an active token may let the request proceed with its current access token. A renewal outage for an inactive token, where renewal is forced, answers `502`. Neither outcome deletes the stored session.
+
+## Provider discovery
+
+The plugin fetches the realm's OpenID Connect discovery document on first use, not during middleware construction. Startup and dynamic configuration reloads therefore never require Keycloak to be reachable, and a temporarily unavailable provider cannot prevent Traefik from loading the plugin.
+
+Discovery runs once at a time and is cached after success. If it fails, the failure is not cached: a later login or request needing the provider retries discovery. While discovery is unavailable, a navigation request that would start a login receives `502`, and clients can retry later without restarting Traefik.
+
+`LegacySupport` does not probe the provider. When enabled, the plugin statically appends `/auth` to the configured base URL if the final path segment is not already `auth`. Leave it disabled for current Keycloak releases.
+
+## Authorization is the application's job
+
+This middleware authenticates and identifies the user. It does not authorize. `X-Forwarded-User` is a trusted-proxy convention, not an OpenID Connect standard, and carries no proof of roles or groups. There is no role or group authorization feature. A downstream application must enforce its own authorization and must not trust these headers from any path that bypasses this middleware.
+
+## Migration from earlier versions
+
+- Upgrading invalidates sessions issued by earlier versions, so users must sign in again. Incoming identity headers and `Authorization` are stripped before routing, including on ignored paths.
+- `TokenCookieName` / `AUTH_TOKEN` are removed. The plugin issues one host-only `__Host-` session cookie whose name is derived from the client; it is not configurable.
+- The authorization-cookie behavior is removed. `UseAuthHeader` controls whether the bearer token is forwarded in the `Authorization` header.
+- The client-credentials grant is removed. Authentication always uses the authorization-code flow.
+- `SilentRenewal` and the one-hour legacy session are removed. The plugin always renews with the refresh token as described above, and uses 303 redirects, never 307.
+- `IgnorePathPrefixes` now matches by path segment (`/healthz` matches `/healthz` and `/healthz/...`), not by substring. Trailing slashes are removed, and `/` disables authentication for every path on the router.
+- `CallbackURL` is now required and must be registered on the Keycloak client. Existing deployments must add it and update their client redirect URIs.
+- `LegacySupport` no longer changes session behavior; it statically appends `/auth` to the Keycloak base URL and never probes the provider. Remove it unless you target such an instance.
+
+## Plugin dependencies
+
+Traefik runs this plugin through Yaegi, which resolves the plugin's Go dependencies from the source that ships with the plugin rather than from a remote module proxy. The dependencies declared in `go.mod` must therefore remain vendored under `vendor/`, which is committed alongside the plugin source.
+
+After adding, removing, or updating a dependency, run `go mod tidy && go mod vendor` and commit the resulting `go.mod`, `go.sum`, and `vendor/` changes together. `make check` verifies that the vendored dependencies still match `go.mod`.
 
 ## Local development
 

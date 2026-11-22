@@ -35,6 +35,20 @@
   register: demo_mode_prune
   changed_when: "'deleted' in demo_mode_prune.stdout"
 
+- name: Remove obsolete shared routing resources
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/k3s
+      - kubectl
+      - delete
+      - middlewares.traefik.io/shared-auth
+      - ingressroutes.traefik.io/helloworld-shared-auth
+      - ingressroutes.traefik.io/helloworld-shared-internal
+      - "--namespace={{ demo_namespace }}"
+      - --ignore-not-found
+  register: obsolete_shared_prune
+  changed_when: "'deleted' in obsolete_shared_prune.stdout"
+
 - name: Apply the {{ demo_mode }} routing manifest
   ansible.builtin.include_tasks:
     file: "{{ playbook_dir }}/tasks/apply-manifest.yml"

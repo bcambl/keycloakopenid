@@ -2,109 +2,30 @@ package keycloakopenid
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
-	"errors"
-	"fmt"
-	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 )
 
-type testKeycloak struct {
-	srv              *httptest.Server
-	introspectStatus int
-	introspectActive bool
-	tokenStatus      int
-	tokenBody        string
-	tokenClose       bool
-	refreshDelay     time.Duration
-	mu               sync.Mutex
-	refreshCount     int
-	lastRefreshForm  url.Values
-}
-
-func boolPtr(v bool) *bool {
-	return &v
-}
-
-func tokenJSON(access, refresh string, expiresIn int) string {
-	return fmt.Sprintf(`{"access_token":%q,"refresh_token":%q,"expires_in":%d}`, access, refresh, expiresIn)
-}
-
-func jwtWithClaims(jsonClaims string) string {
-	encoding := base64.StdEncoding.WithPadding(base64.NoPadding)
-	header := encoding.EncodeToString([]byte(`{"alg":"none"}`))
-	return header + "." + encoding.EncodeToString([]byte(jsonClaims)) + ".sig"
-}
-
-func newTestKeycloak(t *testing.T) *testKeycloak {
+// newAuth builds a middleware for the given OIDC test provider, applying
+// mutate to the configuration before construction.
+func newAuth(t *testing.T, p *oidcTestProvider, mutate func(*Config)) *keycloakAuth {
 	t.Helper()
-	kc := &testKeycloak{
-		introspectStatus: http.StatusOK,
-		introspectActive: true,
-		tokenStatus:      http.StatusOK,
+	config := Config{
+		KeycloakURL:     p.srv.URL,
+		ClientID:        p.clientID,
+		ClientSecret:    "client-secret",
+		KeycloakRealm:   "r",
+		CallbackURL:     "https://app.test/callback",
+		SessionCapacity: 10000,
 	}
-	kc.tokenBody = tokenJSON("access", "refresh", 300)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/realms/r/protocol/openid-connect/token", func(rw http.ResponseWriter, req *http.Request) {
-		if kc.tokenClose {
-			hijacker, ok := rw.(http.Hijacker)
-			if ok {
-				conn, _, err := hijacker.Hijack()
-				if err == nil {
-					_ = conn.Close()
-				}
-				return
-			}
-		}
-		if err := req.ParseForm(); err != nil {
-			rw.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		if req.Form.Get("grant_type") == "refresh_token" {
-			kc.mu.Lock()
-			kc.refreshCount++
-			form := url.Values{}
-			for key, values := range req.Form {
-				form[key] = append([]string(nil), values...)
-			}
-			kc.lastRefreshForm = form
-			kc.mu.Unlock()
-			if kc.refreshDelay > 0 {
-				time.Sleep(kc.refreshDelay)
-			}
-		}
-		rw.Header().Set("Content-Type", "application/json")
-		rw.WriteHeader(kc.tokenStatus)
-		_, _ = io.WriteString(rw, kc.tokenBody)
-	})
-	mux.HandleFunc("/realms/r/protocol/openid-connect/token/introspect", func(rw http.ResponseWriter, _ *http.Request) {
-		rw.Header().Set("Content-Type", "application/json")
-		rw.WriteHeader(kc.introspectStatus)
-		_, _ = io.WriteString(rw, fmt.Sprintf(`{"active":%t}`, kc.introspectActive))
-	})
-
-	kc.srv = httptest.NewServer(mux)
-	t.Cleanup(kc.srv.Close)
-	return kc
-}
-
-func newTestMiddleware(t *testing.T, kc *testKeycloak, config Config) *keycloakAuth {
-	t.Helper()
-	config.KeycloakURL = kc.srv.URL
-	if config.ClientID == "" {
-		config.ClientID = "c"
+	if mutate != nil {
+		mutate(&config)
 	}
-	config.ClientSecret = "s"
-	config.KeycloakRealm = "r"
-	config.UseAuthHeader = true
 	handler, err := New(context.Background(), http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
 		rw.WriteHeader(http.StatusOK)
 	}), &config, "test")
@@ -118,218 +39,259 @@ func newTestMiddleware(t *testing.T, kc *testKeycloak, config Config) *keycloakA
 	return auth
 }
 
-func (kc *testKeycloak) refreshCalls() int {
-	kc.mu.Lock()
-	defer kc.mu.Unlock()
-	return kc.refreshCount
+// capture records what the next handler received.
+type capture struct {
+	called bool
+	user   string
+	authz  string
 }
 
-func (kc *testKeycloak) lastForm() url.Values {
-	kc.mu.Lock()
-	defer kc.mu.Unlock()
-	return kc.lastRefreshForm
+func (c *capture) handler() http.HandlerFunc {
+	return func(rw http.ResponseWriter, req *http.Request) {
+		c.called = true
+		c.user = req.Header.Get("X-Forwarded-User")
+		c.authz = req.Header.Get("Authorization")
+		rw.WriteHeader(http.StatusOK)
+	}
 }
 
-func TestExchangeAuthCodeReturnsFullTokenResponse(t *testing.T) {
-	kc := newTestKeycloak(t)
-	auth := newTestMiddleware(t, kc, Config{})
-	state := base64.StdEncoding.EncodeToString([]byte(`{"redirect_url":"https://app.test/x"}`))
+func navigationGet(target string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Accept", "text/html")
+	return req
+}
 
-	resp, err := auth.exchangeAuthCode("code", state)
+func apiGet(target string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, target, nil)
+	req.Header.Set("Accept", "application/json")
+	return req
+}
+
+// peekLogin returns the nonce and verifier of a pending login transaction
+// without consuming it.
+func peekLogin(t *testing.T, auth *keycloakAuth, state string) (nonce, verifier string) {
+	t.Helper()
+	auth.loginStore.mu.Lock()
+	defer auth.loginStore.mu.Unlock()
+	elem := auth.loginStore.byState[state]
+	if elem == nil {
+		t.Fatalf("no pending transaction for state %q", state)
+	}
+	tx := elem.Value.(*loginEntry).tx
+	return tx.nonce, tx.verifier
+}
+
+// validTokenResponse builds a token response with a signed ID token carrying
+// the given nonce and the preferred_username "alice".
+func validTokenResponse(p *oidcTestProvider, nonce, access string) string {
+	claims := p.baseClaims()
+	claims["nonce"] = nonce
+	claims["at_hash"] = computeAtHash(access)
+	claims["preferred_username"] = "alice"
+	return marshalTokenResponse(access, "refresh-token", p.signIDToken(claims), 300, nil)
+}
+
+// startLogin drives a navigation request through the middleware and returns the
+// callback state from the resulting auth redirect.
+func startLogin(t *testing.T, auth *keycloakAuth, returnTarget string) string {
+	t.Helper()
+	rw := httptest.NewRecorder()
+	auth.ServeHTTP(rw, navigationGet("https://app.test"+returnTarget))
+	if rw.Code != http.StatusSeeOther {
+		t.Fatalf("login start status = %d, want 303", rw.Code)
+	}
+	loc, err := url.Parse(rw.Header().Get("Location"))
 	if err != nil {
-		t.Fatalf("exchangeAuthCode returned error: %v", err)
+		t.Fatalf("unparseable Location %q: %v", rw.Header().Get("Location"), err)
 	}
-	if resp.AccessToken != "access" {
-		t.Fatalf("AccessToken = %q, want access", resp.AccessToken)
+	state := loc.Query().Get("state")
+	if state == "" {
+		t.Fatal("auth URL missing state")
 	}
-	if resp.RefreshToken != "refresh" {
-		t.Fatalf("RefreshToken = %q, want refresh", resp.RefreshToken)
-	}
-	if resp.ExpiresIn != 300 {
-		t.Fatalf("ExpiresIn = %d, want 300", resp.ExpiresIn)
-	}
+	return state
 }
 
-func TestRefreshAccessTokenUsesRefreshGrant(t *testing.T) {
-	kc := newTestKeycloak(t)
-	auth := newTestMiddleware(t, kc, Config{})
+// completeLogin runs a full navigation login through the callback and returns
+// the issued session cookie value plus the recorded authorization headers.
+func completeLogin(t *testing.T, auth *keycloakAuth, p *oidcTestProvider, returnTarget string) string {
+	t.Helper()
+	state := startLogin(t, auth, returnTarget)
+	nonce, verifier := peekLogin(t, auth, state)
+	if verifier == "" {
+		t.Fatal("login transaction missing verifier")
+	}
 
-	if _, err := auth.refreshAccessToken("rt1"); err != nil {
-		t.Fatalf("refreshAccessToken returned error: %v", err)
-	}
-	form := kc.lastForm()
-	if got := form.Get("grant_type"); got != "refresh_token" {
-		t.Fatalf("grant_type = %q, want refresh_token", got)
-	}
-	if got := form.Get("refresh_token"); got != "rt1" {
-		t.Fatalf("refresh_token = %q, want rt1", got)
-	}
-	if got := form.Get("client_id"); got != "c" {
-		t.Fatalf("client_id = %q, want c", got)
-	}
-}
+	p.setToken(validTokenResponse(p, nonce, "access-token"))
+	rw := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "https://app.test/callback?code=CODE&state="+state, nil)
+	req.AddCookie(&http.Cookie{Name: loginCookieName(auth.clientKey, state), Value: state})
+	auth.ServeHTTP(rw, req)
 
-func TestRefreshAccessTokenRejectsMissingExpiry(t *testing.T) {
-	kc := newTestKeycloak(t)
-	kc.tokenBody = tokenJSON("a", "r", 0)
-	auth := newTestMiddleware(t, kc, Config{})
-
-	_, err := auth.refreshAccessToken("rt")
-	if err == nil || !strings.Contains(err.Error(), "missing expires_in") {
-		t.Fatalf("error = %v, want missing expires_in", err)
+	if rw.Code != http.StatusSeeOther {
+		t.Fatalf("callback status = %d, want 303", rw.Code)
 	}
-}
-
-func TestRenewSessionUpdatesTokens(t *testing.T) {
-	kc := newTestKeycloak(t)
-	kc.tokenBody = tokenJSON("new", "rt2", 300)
-	auth := newTestMiddleware(t, kc, Config{})
-	s := &Session{AccessToken: "old", RefreshToken: "rt1", ExpiresAt: time.Now().Add(-time.Second)}
-
-	if err := auth.renewSession(s); err != nil {
-		t.Fatalf("renewSession returned error: %v", err)
+	if loc := rw.Header().Get("Location"); loc != "https://app.test"+returnTarget {
+		t.Fatalf("Location = %q, want %q", loc, "https://app.test"+returnTarget)
 	}
-	if s.AccessToken != "new" {
-		t.Fatalf("AccessToken = %q, want new", s.AccessToken)
-	}
-	if s.RefreshToken != "rt2" {
-		t.Fatalf("RefreshToken = %q, want rt2", s.RefreshToken)
-	}
-	remaining := time.Until(s.ExpiresAt)
-	if remaining < 295*time.Second || remaining > 305*time.Second {
-		t.Fatalf("ExpiresAt is %v away, want about 300s", remaining)
-	}
-}
-
-func TestRenewSessionRecordsRefreshExpiry(t *testing.T) {
-	kc := newTestKeycloak(t)
-	kc.tokenBody = `{"access_token":"new","refresh_token":"rt2","expires_in":300,"refresh_expires_in":1800}`
-	auth := newTestMiddleware(t, kc, Config{})
-	s := &Session{AccessToken: "old", RefreshToken: "rt1", ExpiresAt: time.Now().Add(-time.Second)}
-
-	if err := auth.renewSession(s); err != nil {
-		t.Fatalf("renewSession returned error: %v", err)
-	}
-	remaining := time.Until(s.RefreshExpiresAt)
-	if remaining < 1795*time.Second || remaining > 1805*time.Second {
-		t.Fatalf("RefreshExpiresAt is %v away, want about 1800s", remaining)
-	}
-}
-
-func TestRenewSessionSerializedSingleFlight(t *testing.T) {
-	kc := newTestKeycloak(t)
-	kc.refreshDelay = 50 * time.Millisecond
-	auth := newTestMiddleware(t, kc, Config{})
-	s := &Session{AccessToken: "old", RefreshToken: "rt1", ExpiresAt: time.Now().Add(-time.Second)}
-
-	var wg sync.WaitGroup
-	errs := make([]error, 2)
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			errs[idx] = auth.renewSession(s)
-		}(i)
-	}
-	wg.Wait()
-	for _, err := range errs {
-		if err != nil {
-			t.Fatalf("renewSession returned error: %v", err)
+	for _, c := range rw.Result().Cookies() {
+		if c.Name == sessionCookieName(auth.clientKey) {
+			return c.Value
 		}
 	}
-	if got := kc.refreshCalls(); got != 1 {
-		t.Fatalf("refreshCount = %d, want 1", got)
+	t.Fatal("no session cookie issued")
+	return ""
+}
+
+func resetSharedStores() {
+	sharedStoresMu.Lock()
+	entries := sharedStores
+	sharedStores = map[string]*sharedClientStores{}
+	sharedStoresMu.Unlock()
+	for _, entry := range entries {
+		if entry.retire != nil {
+			entry.retire.Stop()
+		}
+		entry.sessions.Close()
+		entry.logins.Close()
 	}
 }
 
-func TestRenewSessionUsesRotatedRefreshToken(t *testing.T) {
-	kc := newTestKeycloak(t)
-	kc.tokenBody = tokenJSON("new", "rt2", 300)
-	auth := newTestMiddleware(t, kc, Config{})
-	s := &Session{AccessToken: "old", RefreshToken: "rt1", ExpiresAt: time.Now().Add(-time.Second)}
-
-	if err := auth.renewSession(s); err != nil {
-		t.Fatalf("first renewSession returned error: %v", err)
-	}
-	s.ExpiresAt = time.Now().Add(-time.Second)
-	if err := auth.renewSession(s); err != nil {
-		t.Fatalf("second renewSession returned error: %v", err)
-	}
-	if got := kc.lastForm().Get("refresh_token"); got != "rt2" {
-		t.Fatalf("refresh_token = %q, want rotated rt2", got)
-	}
-	if got := kc.refreshCalls(); got != 2 {
-		t.Fatalf("refreshCount = %d, want 2", got)
+func TestPKCEChallenge(t *testing.T) {
+	verifier := "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	sum := sha256.Sum256([]byte(verifier))
+	want := base64.RawURLEncoding.EncodeToString(sum[:])
+	if got := pkceChallenge(verifier); got != want {
+		t.Fatalf("pkceChallenge = %q, want %q", got, want)
 	}
 }
 
-func TestRenewSessionAlreadyRenewedSkips(t *testing.T) {
-	kc := newTestKeycloak(t)
-	auth := newTestMiddleware(t, kc, Config{})
-	s := &Session{AccessToken: "old", RefreshToken: "rt1", ExpiresAt: time.Now().Add(-time.Second)}
-
-	if err := auth.renewSession(s); err != nil {
-		t.Fatalf("renewSession returned error: %v", err)
+func TestResolveReturnTarget(t *testing.T) {
+	cb, _ := url.Parse("https://app.test/callback")
+	cases := []struct{ target, want string }{
+		{"/dashboard", "https://app.test/dashboard"},
+		{"/dashboard?tab=1", "https://app.test/dashboard?tab=1"},
+		{"/foo%3Fbar", "https://app.test/foo%3Fbar"},
+		{"/foo%3fbar?next=%2F", "https://app.test/foo%3fbar?next=%2F"},
+		{"/", "https://app.test/"},
 	}
-	if err := auth.renewSession(s); err != nil {
-		t.Fatalf("second renewSession returned error: %v", err)
-	}
-	if got := kc.refreshCalls(); got != 1 {
-		t.Fatalf("refreshCount = %d, want 1", got)
-	}
-}
-
-func TestRenewSessionKeepsRefreshTokenWhenNotRotated(t *testing.T) {
-	kc := newTestKeycloak(t)
-	kc.tokenBody = `{"access_token":"new","expires_in":300}`
-	auth := newTestMiddleware(t, kc, Config{})
-	s := &Session{AccessToken: "old", RefreshToken: "rt1", ExpiresAt: time.Now().Add(-time.Second)}
-
-	if err := auth.renewSession(s); err != nil {
-		t.Fatalf("renewSession returned error: %v", err)
-	}
-	if s.AccessToken != "new" {
-		t.Fatalf("AccessToken = %q, want new", s.AccessToken)
-	}
-	if s.RefreshToken != "rt1" {
-		t.Fatalf("RefreshToken = %q, want rt1 retained when the response omits refresh_token", s.RefreshToken)
+	for _, tc := range cases {
+		if got := resolveReturnTarget(cb, tc.target); got != tc.want {
+			t.Fatalf("resolveReturnTarget(%q) = %q, want %q", tc.target, got, tc.want)
+		}
 	}
 }
 
-func TestRenewSessionRejectsMissingAccessToken(t *testing.T) {
-	kc := newTestKeycloak(t)
-	kc.tokenBody = `{"refresh_token":"rt2","expires_in":300}`
-	auth := newTestMiddleware(t, kc, Config{})
-	s := &Session{AccessToken: "old", RefreshToken: "rt1", ExpiresAt: time.Now().Add(-time.Second)}
-
-	err := auth.renewSession(s)
-	if err == nil || !strings.Contains(err.Error(), "missing access_token") {
-		t.Fatalf("error = %v, want missing access_token", err)
-	}
-	if s.AccessToken != "old" || s.RefreshToken != "rt1" {
-		t.Fatalf("session mutated on malformed refresh response: %+v", s)
-	}
-}
-
-func TestIsRefreshRefused(t *testing.T) {
+func TestIgnoredPathSegmentMatching(t *testing.T) {
+	k := &keycloakAuth{IgnorePathPrefixes: []string{"/api", "/favicon.ico"}}
 	cases := []struct {
-		name string
-		err  error
+		path string
 		want bool
 	}{
-		{"invalid grant 400", &keycloakError{Status: 400, Body: `{"error":"invalid_grant"}`}, true},
-		{"invalid grant 401", &keycloakError{Status: 401, Body: `{"error":"invalid_grant"}`}, true},
-		{"invalid grant 500", &keycloakError{Status: 500, Body: `{"error":"invalid_grant"}`}, false},
-		{"invalid client 400", &keycloakError{Status: 400, Body: `{"error":"invalid_client"}`}, false},
-		{"plain error", errors.New("boom"), false},
-		{"network error", &net.DNSError{IsTimeout: true}, false},
-		{"nil", nil, false},
+		{"/api", true},
+		{"/api/users", true},
+		{"/api/", true},
+		{"/apix", false},
+		{"/x/api", false},
+		{"/favicon.ico", true},
+		{"/favicon.ico.png", false},
+		{"/healthz", false},
+	}
+	for _, tc := range cases {
+		if got := k.isIgnoredPath(tc.path); got != tc.want {
+			t.Fatalf("isIgnoredPath(%q) = %t, want %t", tc.path, got, tc.want)
+		}
+	}
+}
+
+func TestRootAndTrailingSlashIgnorePathMatching(t *testing.T) {
+	trailing := &keycloakAuth{IgnorePathPrefixes: []string{"/api/"}}
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"/api", true},
+		{"/api/", true},
+		{"/api/users", true},
+		{"/apix", false},
+	}
+	for _, tc := range cases {
+		if got := trailing.isIgnoredPath(tc.path); got != tc.want {
+			t.Fatalf("isIgnoredPath(%q) with prefix /api/ = %t, want %t", tc.path, got, tc.want)
+		}
+	}
+
+	root := &keycloakAuth{IgnorePathPrefixes: []string{"/"}}
+	for _, path := range []string{"/", "/healthz", "/admin"} {
+		if !root.isIgnoredPath(path) {
+			t.Fatalf("isIgnoredPath(%q) with prefix / = false, want true", path)
+		}
+	}
+}
+
+func TestLoginDiscoveryOutageThenRecovery(t *testing.T) {
+	p := newOIDCTestProvider(t)
+	auth := newAuth(t, p, nil)
+
+	p.mu.Lock()
+	p.discoveryStatus = http.StatusInternalServerError
+	p.mu.Unlock()
+
+	rw := httptest.NewRecorder()
+	auth.ServeHTTP(rw, navigationGet("https://app.test/dashboard"))
+	if rw.Code != http.StatusBadGateway {
+		t.Fatalf("status during discovery outage = %d, want 502", rw.Code)
+	}
+
+	p.mu.Lock()
+	p.discoveryStatus = http.StatusOK
+	p.mu.Unlock()
+
+	rw = httptest.NewRecorder()
+	auth.ServeHTTP(rw, navigationGet("https://app.test/dashboard"))
+	if rw.Code != http.StatusSeeOther {
+		t.Fatalf("status after discovery recovery = %d, want 303", rw.Code)
+	}
+}
+
+func TestIsNavigationRequestTable(t *testing.T) {
+	cases := []struct {
+		name      string
+		method    string
+		fetchMode string
+		accept    string
+		xhr       bool
+		want      bool
+	}{
+		{"navigation", http.MethodGet, "navigate", "text/html", false, true},
+		{"cors", http.MethodGet, "cors", "application/json", false, false},
+		{"no fetch metadata html", http.MethodGet, "", "text/html", false, true},
+		{"no fetch metadata xhr", http.MethodGet, "", "text/html", true, false},
+		{"post navigation", http.MethodPost, "navigate", "text/html", false, false},
+		{"json accept", http.MethodGet, "", "application/json", false, false},
+		{"navigate with JSON accept", http.MethodGet, "navigate", "application/json", false, false},
+		{"navigate with XHR marker", http.MethodGet, "navigate", "text/html", true, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isRefreshRefused(tc.err); got != tc.want {
-				t.Fatalf("isRefreshRefused = %t, want %t", got, tc.want)
+			req := httptest.NewRequest(tc.method, "https://app.test/x", nil)
+			if tc.fetchMode != "" {
+				req.Header.Set("Sec-Fetch-Mode", tc.fetchMode)
+			}
+			req.Header.Set("Accept", tc.accept)
+			if tc.xhr {
+				req.Header.Set("X-Requested-With", "XMLHttpRequest")
+			}
+			if got := isNavigationRequest(req); got != tc.want {
+				t.Fatalf("isNavigationRequest = %t, want %t", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestSessionCookieNameHasHostPrefix(t *testing.T) {
+	name := sessionCookieName("https://kc/r/c")
+	if !strings.HasPrefix(name, "__Host-") {
+		t.Fatalf("session cookie name %q must carry the __Host- prefix", name)
 	}
 }
