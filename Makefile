@@ -3,8 +3,8 @@
 GO ?= go
 GOFMT ?= gofmt
 GOLANGCI_LINT ?= golangci-lint
+PODMAN ?= podman
 PYTHON ?= python3
-COMPOSE ?= podman compose -f podman-compose.yml
 
 VM_HOST ?=
 VM_USER ?=
@@ -19,6 +19,15 @@ export VM_HOST VM_USER VM_PASS
 
 MODULES := . dev/helloworld
 GO_FILES := $(wildcard *.go) $(wildcard dev/helloworld/*.go)
+
+STACK ?= keycloakopenid
+STACK_NETWORK := $(STACK)_default
+HELLOWORLD_IMAGE := localhost/$(STACK)_helloworld:latest
+KEYCLOAK_CONTAINER := $(STACK)_keycloak_1
+TRAEFIK_CONTAINER := $(STACK)_traefik_1
+HELLOWORLD1_CONTAINER := $(STACK)_helloworld1_1
+HELLOWORLD2_CONTAINER := $(STACK)_helloworld2_1
+CONTAINERS := $(TRAEFIK_CONTAINER) $(HELLOWORLD1_CONTAINER) $(HELLOWORLD2_CONTAINER) $(KEYCLOAK_CONTAINER)
 
 .PHONY: help tag-patch tag-minor tag-major fmt fmt-check vet lint test test-race cover tidy vendor-check check up down restart logs ps smoke demo clean require-vm-env vm-venv vm-check vm-syntax vm-up vm-demo-per-app vm-demo-shared vm-sync vm-status vm-logs vm-down vm-uninstall-k3s vm-kubeconfig
 
@@ -108,20 +117,56 @@ vendor-check: ## Verify `go mod vendor` produces no uncommitted diff
 
 check: fmt-check lint test vendor-check ## Run formatting, lint, test, and vendor checks
 
-up: ## Build and start the local Podman development stack
-	$(COMPOSE) up --build -d
+up: down ## Build and start the local Podman development stack
+	$(PODMAN) build -t $(HELLOWORLD_IMAGE) dev/helloworld
+	@$(PODMAN) network exists $(STACK_NETWORK) || $(PODMAN) network create $(STACK_NETWORK)
+	$(PODMAN) run -d --name $(KEYCLOAK_CONTAINER) \
+		--network $(STACK_NETWORK) \
+		-p 127.0.0.1:8081:8081 \
+		-e KC_BOOTSTRAP_ADMIN_USERNAME=demo-admin \
+		-e KC_BOOTSTRAP_ADMIN_PASSWORD=demo-admin-password \
+		-v "$(CURDIR)/dev/keycloak:/opt/keycloak/data/import:ro" \
+		--security-opt label=disable \
+		quay.io/keycloak/keycloak:26.3.5 \
+		start-dev --http-host=0.0.0.0 --http-port=8081 --import-realm
+	$(PODMAN) run -d --name $(TRAEFIK_CONTAINER) \
+		--network host \
+		-v "$(CURDIR):/plugins-local/src/github.com/bcambl/keycloakopenid:ro" \
+		-v "$(CURDIR)/dev/traefik:/etc/traefik:ro" \
+		--security-opt label=disable \
+		traefik:v3.3.3 \
+		--configFile=/etc/traefik/traefik.yml
+	$(PODMAN) run -d --name $(HELLOWORLD1_CONTAINER) \
+		--network $(STACK_NETWORK) \
+		-p 127.0.0.1:9001:8080 \
+		-e APP_NAME=helloworld1 \
+		-e OTHER_APP_URL=http://helloworld2.localhost:8000 \
+		$(HELLOWORLD_IMAGE)
+	$(PODMAN) run -d --name $(HELLOWORLD2_CONTAINER) \
+		--network $(STACK_NETWORK) \
+		-p 127.0.0.1:9002:8080 \
+		-e APP_NAME=helloworld2 \
+		-e OTHER_APP_URL=http://helloworld1.localhost:8000 \
+		$(HELLOWORLD_IMAGE)
 
 down: ## Stop and remove the local development stack
-	$(COMPOSE) down
+	@for container in $(CONTAINERS); do \
+		$(PODMAN) rm -f --ignore "$$container"; \
+	done
+	@if $(PODMAN) network exists $(STACK_NETWORK); then $(PODMAN) network rm $(STACK_NETWORK); fi
 
 restart: ## Restart Traefik to reload plugin changes
-	$(COMPOSE) restart traefik
+	$(PODMAN) restart $(TRAEFIK_CONTAINER)
 
 logs: ## Show the latest logs from the local stack
-	$(COMPOSE) logs --tail=100
+	@for container in $(CONTAINERS); do \
+		if $(PODMAN) container exists "$$container"; then \
+			$(PODMAN) logs --names --tail=100 "$$container"; \
+		fi; \
+	done
 
 ps: ## Show local development stack service status
-	$(COMPOSE) ps
+	$(PODMAN) ps -a --filter name=$(STACK)_ --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
 
 smoke: ## Run the local Keycloak and proxy end-to-end smoke test
 	$(PYTHON) dev/scripts/smoke-test.py

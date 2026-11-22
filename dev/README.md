@@ -4,7 +4,7 @@ This stack runs Keycloak, Traefik with the plugin loaded from this checkout, and
 
 ## Prerequisites
 
-- Podman with a Compose provider (`podman compose` uses an installed `podman-compose` or `docker-compose` provider).
+- Podman.
 - Internet access the first time you start the stack, to pull the container images.
 - Python 3 for the standard-library smoke test.
 
@@ -16,7 +16,7 @@ From the repository root, build and start the services with the Makefile:
 make up
 ```
 
-Run `make help` to list all available development, Go check, and stack-management targets. The default `COMPOSE` command is `podman compose -f podman-compose.yml`; override `COMPOSE` if your Podman Compose provider needs a different invocation.
+Run `make help` to list all available development, Go check, and stack-management targets. The stack targets use native Podman commands; no Compose provider is required.
 
 Keycloak imports `dev/keycloak/demo-realm.json` when its data directory is empty. After changing realm settings, recreate the Keycloak container so the realm is imported again (`make down && make demo`); the smoke test verifies the running realm's access-token lifetime and reports an actionable error when a pre-existing container still carries the old settings. Wait for Keycloak and Traefik to finish starting before opening the apps:
 
@@ -67,6 +67,6 @@ Stop and remove the containers with:
 make down
 ```
 
-Keycloak's imported realm is not persisted across container removal. If a browser has an old session, sign out or clear cookies for the two `*.localhost` apps and `127.0.0.1:8081` before retrying. Check startup output with `make logs`. The services use loopback ports 8000, 8081, 8090, 9001, and 9002; if those ports are already in use, update the corresponding bindings and URLs in `podman-compose.yml`, `dev/traefik/traefik.yml`, `dev/traefik/dynamic.yml`, and the realm redirect URIs.
+Keycloak's imported realm is not persisted across container removal. If a browser has an old session, sign out or clear cookies for the two `*.localhost` apps and `127.0.0.1:8081` before retrying. Check startup output with `make logs`. The services use loopback ports 8000, 8081, 8090, 9001, and 9002; if those ports are already in use, update the corresponding bindings and URLs in the `Makefile`, `dev/traefik/traefik.yml`, `dev/traefik/dynamic.yml`, and the realm redirect URIs.
 
 This environment demonstrates the middleware on an isolated loopback stack, not production hardening. The plugin strips incoming `X-Forwarded-User` and `Authorization` on every request and issues a host-only `__Host-` session cookie; sessions are process-local, so a single Traefik instance is required and a restart signs everyone out. The example app only decodes token claims for display and does not validate them or enforce authorization; it must not be used as an authorization example.

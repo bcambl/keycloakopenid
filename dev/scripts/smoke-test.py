@@ -269,7 +269,7 @@ def wait_for_stack():
         except (urllib.error.URLError, OSError):
             pass
         time.sleep(2)
-    raise RuntimeError("Timed out waiting for Keycloak and Traefik; inspect compose logs")
+    raise RuntimeError("Timed out waiting for Keycloak and Traefik; inspect the stack logs with `make logs`")
 
 
 def authenticate_first_app():
